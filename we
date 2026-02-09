@@ -49,7 +49,7 @@ except ImportError as e:
 
 from aiogram import Bot, Dispatcher, types, F, Router
 from aiogram.client.bot import DefaultBotProperties
-from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramUnauthorizedError, TelegramNotFound
+from aiogram.exceptions import TelegramForbiddenError, TelegramBadRequest, TelegramUnauthorizedError, TelegramNotFound, TelegramRetryAfter
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -2315,6 +2315,80 @@ class Database:
         except Exception as e:
             logger.error(f"Log broadcast error: {e}")
 
+
+async def send_broadcast(bot, user_ids, message_text, db=None, admin_id: int = None, *, delay: float = 0.05, max_retries: int = 2):
+    """دالة إرسال إذاعة ذكية ومتوافقة مع النظام (aiogram)
+
+    - تتعامل مع FloodWait (TelegramRetryAfter) بشكل آلي
+    - تحدد حالات المحظورين والحسابات المحذوفة وتحدث القاعدة إن أمكن
+    - تحاول إعادة الإرسال عند الحاجة مع حد أقصى من المحاولات
+    - تحافظ على تباعد زمني بسيط لتقليل احتمال الحظر
+    """
+    success_count = 0
+    blocked_count = 0
+    failed_count = 0
+
+    total = len(user_ids or [])
+    logger.info(f"Starting broadcast to {total} targets")
+
+    for user_id in user_ids:
+        attempt = 0
+        while attempt <= max_retries:
+            try:
+                await bot.send_message(chat_id=user_id, text=message_text, parse_mode="HTML")
+                success_count += 1
+                await asyncio.sleep(delay)
+                break
+
+            except TelegramRetryAfter as e:
+                wait = getattr(e, 'retry_after', getattr(e, 'timeout', None)) or 5
+                logger.warning(f"Flood detected, sleeping for {wait} seconds (user={user_id})")
+                await asyncio.sleep(wait)
+                attempt += 1
+                continue
+
+            except TelegramForbiddenError:
+                # user blocked the bot or bot banned from chat
+                blocked_count += 1
+                try:
+                    if db and hasattr(db, 'block_user') and admin_id is not None:
+                        db.block_user(user_id, admin_id)
+                except Exception:
+                    pass
+                break
+
+            except TelegramBadRequest as e:
+                # bad request (e.g., chat not found, user deleted account)
+                failed_count += 1
+                logger.debug(f"BadRequest for {user_id}: {e}")
+                break
+
+            except Exception as e:
+                # أي خطأ غير متوقع - سجل وحاول مرة أخرى حسب المحاولات
+                logger.error(f"Unexpected error sending to {user_id}: {e}")
+                attempt += 1
+                await asyncio.sleep(min(2 ** attempt, 10))
+                if attempt > max_retries:
+                    failed_count += 1
+                    break
+
+    logger.info(f"Broadcast finished: Success={success_count}, Blocked={blocked_count}, Failed={failed_count}")
+
+    # تسجيل الإذاعة في قاعدة البيانات إذا توفرت معلومات
+    try:
+        if db and hasattr(db, 'log_broadcast'):
+            preview = (message_text[:200] + '...') if message_text and len(message_text) > 200 else (message_text or '')
+            db.log_broadcast(name=getattr(db, 'last_broadcast_name', 'manual'), preview=preview, target_type='manual', success=success_count, failed=failed_count, admin_id=admin_id or 0)
+    except Exception:
+        pass
+
+    return {
+        'success': success_count,
+        'blocked': blocked_count,
+        'failed': failed_count,
+        'total': total
+    }
+
     # ========== Contact Messages ==========
     def save_contact_message(self, user_id, username, message_id, content_type, text, file_id):
         try:
@@ -2888,21 +2962,12 @@ def get_weekdays_kb():
     return types.ReplyKeyboardMarkup(keyboard=keyboard, resize_keyboard=True, one_time_keyboard=True)
 
 def get_cancel_kb():
-    # زر "إلغاء"
-    return types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="إلغاء")]], resize_keyboard=True, one_time_keyboard=True)
-
-def get_back_kb():
-    # زر "إلغاء" (للتوافق)
-    return types.ReplyKeyboardMarkup(keyboard=[[types.KeyboardButton(text="إلغاء")]], resize_keyboard=True, one_time_keyboard=True)
-
-def get_test_kb():
+    """زر إلغاء محسن يعمل مع جميع الحالات"""
     return types.ReplyKeyboardMarkup(
         keyboard=[
-            [types.KeyboardButton(text="إرسال تجريبي")],
-            [types.KeyboardButton(text="تأكيد الإرسال")],
-            [types.KeyboardButton(text="إلغاء")]
-        ],
-        resize_keyboard=True,
+            [types.KeyboardButton(text="❌ إلغاء")]
+        ], 
+        resize_keyboard=True, 
         one_time_keyboard=True
     )
 
@@ -3226,7 +3291,7 @@ async def cb_listen_reciter(callback: types.CallbackQuery):
 """
     
     # تحديد السور إلى 100 سورة فقط
-    display_surahs = surahs[:100]
+    display_surahs = surahs[:114]
     
     keyboard = []
     row = []
@@ -5173,7 +5238,7 @@ async def cb_search_next(callback: types.CallbackQuery, state: FSMContext):
     """الصفحة التالية من البحث"""
     data = await state.get_data()
     current_page = data.get('current_page', 0)
-    await state.update_data(current_page=current_page + 1)
+    await state.update_data(current_page=current_page + 1)@router.message(Form.sch_confirm)
     await display_search_results(callback.message, state, edit=True)
     await callback.answer()
 
@@ -5283,13 +5348,13 @@ async def btn_admin_panel(message: types.Message, state: FSMContext):
         return
     
     keyboard = types.ReplyKeyboardMarkup(keyboard=[
-        [types.KeyboardButton(text="📢 إذاعة"), types.KeyboardButton(text="📊 الإحصائيات")],
-        [types.KeyboardButton(text="📅 جدولة رسالة"), types.KeyboardButton(text="📬 رسائل واردة")],
-        [types.KeyboardButton(text="👥 إدارة المشرفين"), types.KeyboardButton(text="📣 القنوات والمجموعات")],
-        [types.KeyboardButton(text="🎙️ إدارة القرآن الصوتي"), types.KeyboardButton(text="🛡️ حماية البيانات")],
-        [types.KeyboardButton(text="🎯 التحكم بالأزرار")],
-        [types.KeyboardButton(text="رجوع للقائمة الرئيسية")]
-    ], resize_keyboard=True)
+    [types.KeyboardButton(text="📢 إذاعة"), types.KeyboardButton(text="📊 الإحصائيات")],
+    [types.KeyboardButton(text="📅 جدولة رسالة"), types.KeyboardButton(text="📬 رسائل واردة")],
+    [types.KeyboardButton(text="👥 إدارة المشرفين"), types.KeyboardButton(text="📣 القنوات والمجموعات")],
+    [types.KeyboardButton(text="🎙️ إدارة القرآن الصوتي"), types.KeyboardButton(text="🛡️ حماية البيانات")],
+    [types.KeyboardButton(text="🎯 التحكم بالأزرار"), types.KeyboardButton(text="🧹 صيانة البوت")],  # <-- الزر الجديد هنا
+    [types.KeyboardButton(text="رجوع للقائمة الرئيسية")]
+], resize_keyboard=True)
     
     await message.answer(
         "<b>لوحة التحكم</b>\n\nاختر الخدمة:",
@@ -5570,6 +5635,22 @@ async def process_broadcast_test(message: types.Message, state: FSMContext):
         
         # 🎯 جلب الأهداف بدقة
         ids = db.get_broadcast_targets(target, only_active=True)
+        # Ensure task_id/task_name/task_creator exist.
+        # This broadcast may be manual (no task_id). Use sensible defaults, and only query scheduled_tasks if task_id is provided.
+        task_id = data.get('task_id', 0) or 0
+        task_creator = message.from_user.id
+        task_name = f"manual_broadcast_{message.from_user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        if task_id:
+            try:
+                conn_meta = db.get_connection()
+                meta = conn_meta.execute("SELECT task_name, created_by FROM scheduled_tasks WHERE id=?", (task_id,)).fetchone()
+                conn_meta.close()
+                if meta:
+                    task_name = meta[0] or task_name
+                    task_creator = meta[1] or task_creator
+            except Exception:
+                # Keep defaults on error
+                pass
         
         if not ids:
             await message.answer("⚠️ لا توجد أهداف للإرسال!\n\nتأكد من وجود مستخدمين نشطين.")
@@ -6136,276 +6217,199 @@ async def process_schedule_content(message: types.Message, state: FSMContext):
 async def add_another_schedule_message(message: types.Message, state: FSMContext):
     await message.answer("أرسل الرسالة التالية (نص أو ملف)...")
 
-@router.message(Form.sch_content, F.text == "✅ تأكيد الحفظ")
-async def confirm_schedule_save(message: types.Message, state: FSMContext):
-    data = await state.get_data()
-    sch_messages = data.get('sch_messages', [])
-    if not sch_messages:
-        await message.answer("❌ لا يوجد رسائل محفوظة!")
-        await state.clear()
-        return
-    # احفظ قائمة الرسائل في الجدولة (يمكنك تعديل منطق الجدولة لاحقاً لإرسالها كلها)
-    await state.update_data(sch_messages=sch_messages)
-    await message.answer(f"✅ تم حفظ {len(sch_messages)} رسالة للجدولة.")
-    await state.set_state(Form.sch_confirm)
-    if message.text == "إلغاء":
-        await state.clear()
-        # الرجوع للوحة التحكم للمشرفين
-        if get_db().is_admin(message.from_user.id):
-            keyboard = get_admin_kb()
-            await message.answer("❌ تم الإلغاء.", reply_markup=keyboard)
-        else:
-            await cmd_start(message)
-        return
-    
-    # حفظ المحتوى (دعم جميع أنواع الملفات)
-    content_type = 'text'
-    file_id = None
-    text = message.text or message.caption or ""
-    
-    # ✨ حفظ التنسيقات النصية
-    entities = message.entities or message.caption_entities or []
-    entities_json = None
-    if entities:
-        entities_list = []
-        for entity in entities:
-            entities_list.append({
-                'type': entity.type,
-                'offset': entity.offset,
-                'length': entity.length,
-                'url': entity.url if hasattr(entity, 'url') else None,
-                'user': entity.user.id if hasattr(entity, 'user') and entity.user else None,
-                'language': entity.language if hasattr(entity, 'language') else None,
-            })
-        entities_json = json.dumps(entities_list, ensure_ascii=False)
-        logger.info(f"✨ Schedule message has {len(entities)} formatting entities")
-    
-    effect_id = message.effect_id if hasattr(message, 'effect_id') else None
-    if effect_id:
-        logger.info(f"✨ Schedule message has effect: {effect_id}")
-    
-    if message.photo:
-        content_type = 'photo'
-        file_id = message.photo[-1].file_id
-    elif message.video:
-        content_type = 'video'
-        file_id = message.video.file_id
-    elif message.audio:
-        content_type = 'audio'
-        file_id = message.audio.file_id
-    elif message.voice:
-        content_type = 'voice'
-        file_id = message.voice.file_id
-    elif message.document:
-        content_type = 'document'
-        file_id = message.document.file_id
-    
-    await state.update_data(
-        sch_content_type=content_type,
-        sch_file_id=file_id,
-        sch_text=text,
-        sch_entities=entities_json,  # ✨ حفظ التنسيقات
-        sch_effect_id=effect_id
-    )
-    
-    # معاينة وتأكيد مع زر تجريبي
-    data = await state.get_data()
-    schedule_type = data.get('sch_type')
-    time = data.get('sch_time')
-    target = data.get('sch_target')
-    days = data.get('selected_days', [])
-    once_date = data.get('sch_once_date')
-    
-    summary = f"📋 <b>ملخص الجدولة:</b>\n\n"
-    summary += f"🕐 الوقت: <code>{time}</code>\n"
-    
-    # إضافة معلومات التاريخ والوقت المتبقي
-    if schedule_type == 'once' and once_date:
-        summary += f"📅 التاريخ: <code>{once_date}</code>\n"
-        try:
-            scheduled_dt = datetime.strptime(f"{once_date} {time}", "%Y-%m-%d %H:%M")
-            now = datetime.now()
-            time_diff = scheduled_dt - now
-            
-            if time_diff.total_seconds() > 0:
-                hours = int(time_diff.total_seconds() // 3600)
-                minutes = int((time_diff.total_seconds() % 3600) // 60)
-                days_count = time_diff.days
-                
-                if days_count > 0:
-                    summary += f"⏳ الوقت المتبقي: <code>{days_count} يوم و {hours % 24} ساعة و {minutes} دقيقة</code>\n"
-                elif hours > 0:
-                    summary += f"⏳ الوقت المتبقي: <code>{hours} ساعة و {minutes} دقيقة</code>\n"
-                else:
-                    summary += f"⏳ الوقت المتبقي: <code>{minutes} دقيقة</code>\n"
-            else:
-                summary += f"⚠️ <b>تحذير: الوقت المحدد قد مضى!</b>\n"
-        except:
-            pass
-    
-    summary += f"📆 النوع: <code>{schedule_type}</code>\n"
-    if schedule_type == 'weekly':
-        summary += f"📅 الأيام: {', '.join(days)}\n"
-    summary += f"🎯 الهدف: <code>{target}</code>\n"
-    summary += f"📦 نوع المحتوى: <code>{content_type}</code>\n\n"
-    summary += "الرسالة أعلاه ⬆️\n\n"
-    summary += "💡 يمكنك إرسال رسالة تجريبية لنفسك أولاً للتأكد"
-    
-    keyboard = types.ReplyKeyboardMarkup(keyboard=[
-        [types.KeyboardButton(text="🧪 إرسال تجريبي")],
-        [types.KeyboardButton(text="✅ تأكيد الحفظ")],
-        [types.KeyboardButton(text="إلغاء")]
-    ], resize_keyboard=True)
-    
-    await message.answer(summary, reply_markup=keyboard, parse_mode="HTML")
-    await state.set_state(Form.sch_confirm)
-
 @router.message(Form.sch_confirm)
 async def process_schedule_confirm(message: types.Message, state: FSMContext):
-    if message.text == "رجوع":
+    """معالجة تأكيد حفظ الجدولة - إصلاح شامل"""
+    current_state = await state.get_state()
+    
+    if message.text == "إلغاء" or message.text == "❌ إلغاء":
         await state.clear()
-        await cmd_start(message)
-        return
-    if message.text == "إلغاء":
-        await state.clear()
-        # الرجوع للوحة التحكم للمشرفين
-        if get_db().is_admin(message.from_user.id):
-            keyboard = get_admin_kb()
-            await message.answer("❌ تم الإلغاء.", reply_markup=keyboard)
-        else:
-            await cmd_start(message)
+        db = get_db()
+        is_admin = db.is_admin(message.from_user.id)
+        await message.answer("❌ تم إلغاء الجدولة.", reply_markup=get_main_kb(message.from_user.id, is_admin))
         return
     
-    # معالجة الإرسال التجريبي
     if message.text == "🧪 إرسال تجريبي":
+        # إرسال تجريبي للمشرف نفسه
         data = await state.get_data()
-        content_type = data.get('sch_content_type')
-        file_id = data.get('sch_file_id')
-        text = data.get('sch_text')
+        sch_messages = data.get('sch_messages', [])
         
-        try:
-            if content_type == 'text':
-                await message.answer(text)
-            elif content_type == 'photo':
-                await message.answer_photo(file_id, caption=text)
-            elif content_type == 'video':
-                await message.answer_video(file_id, caption=text)
-            elif content_type == 'audio':
-                await message.answer_audio(file_id, caption=text)
-            elif content_type == 'voice':
-                await message.answer_voice(file_id, caption=text)
-            elif content_type == 'document':
-                await message.answer_document(file_id, caption=text)
+        if not sch_messages:
+            await message.answer("⚠️ لا توجد رسائل محفوظة للإرسال التجريبي")
+            return
             
-            await message.answer("✅ تم إرسال رسالة تجريبية لك!\n\n💡 إذا كانت الرسالة صحيحة، اضغط على 'تأكيد الحفظ'")
+        # إرسال أول رسالة كتجربة
+        first_msg = sch_messages[0]
+        try:
+            if first_msg['type'] == 'text':
+                await message.answer(first_msg['text'])
+            elif first_msg['type'] == 'photo':
+                await message.answer_photo(first_msg['file_id'], caption=first_msg['text'])
+            elif first_msg['type'] == 'video':
+                await message.answer_video(first_msg['file_id'], caption=first_msg['text'])
+            elif first_msg['type'] == 'audio':
+                await message.answer_audio(first_msg['file_id'], caption=first_msg['text'])
+            elif first_msg['type'] == 'document':
+                await message.answer_document(first_msg['file_id'], caption=first_msg['text'])
+            
+            await message.answer(
+                "✅ تم إرسال الرسالة التجريبية!\n\n"
+                "إذا كانت الرسالة صحيحة، اضغط على ✅ تأكيد الحفظ",
+                reply_markup=types.ReplyKeyboardMarkup(keyboard=[
+                    [types.KeyboardButton(text="✅ تأكيد الحفظ")],
+                    [types.KeyboardButton(text="❌ إلغاء")]
+                ], resize_keyboard=True)
+            )
         except Exception as e:
-            await message.answer(f"❌ خطأ في الإرسال: {e}")
+            await message.answer(f"❌ خطأ في الإرسال التجريبي: {e}")
+        return
+    
+    if message.text == "✅ تأكيد الحفظ":
+        data = await state.get_data()
+        db = get_db()
         
-        return
-    
-    if message.text != "✅ تأكيد الحفظ":
-        return
-    
-    # حفظ الجدول في قاعدة البيانات
-    data = await state.get_data()
-    db = get_db()
-    
-    schedule_name = f"جدول {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-    schedule_type = data.get('sch_type')
-    time_str = data.get('sch_time')
-    target = data.get('sch_target')
-    content_type = data.get('sch_content_type')
-    file_id = data.get('sch_file_id')
-    text = data.get('sch_text')
-    days = ','.join(data.get('selected_days', [])) if schedule_type == 'weekly' else None
-    
-    # للجدولة لمرة واحدة: استخدم التاريخ المحدد كـ end_date
-    once_date = data.get('sch_once_date') if schedule_type == 'once' else None
-    
-    # تحقق نهائي: التأكد من أن الوقت لم يمضي
-    if schedule_type == 'once' and once_date and time_str:
+        schedule_type = data.get('sch_type')
+        time_str = data.get('sch_time')
+        target = data.get('sch_target')
+        once_date = data.get('sch_once_date')
+        sch_messages = data.get('sch_messages', [])
+        
+        if not sch_messages:
+            await message.answer("❌ لا توجد رسائل محفوظة!")
+            await state.clear()
+            return
+        
+        # حفظ كل رسالة كمهمة منفصلة أو كمهمة واحدة مع رسائل متعددة
+        conn = db.get_connection()
+        task_ids = []
+        
         try:
-            scheduled_datetime = datetime.strptime(f"{once_date} {time_str}", "%Y-%m-%d %H:%M")
-            now = datetime.now()
+            for idx, msg_data in enumerate(sch_messages):
+                # إنشاء اسم فريد للمهمة
+                schedule_name = f"جدولة {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+                if len(sch_messages) > 1:
+                    schedule_name += f" (رسالة {idx+1}/{len(sch_messages)})"
+                
+                # تحديد التاريخ
+                if schedule_type == 'once' and once_date:
+                    start_date = once_date
+                    end_date = once_date  # لمرة واحدة، نفس التاريخ
+                else:
+                    start_date = datetime.now().strftime("%Y-%m-%d")
+                    end_date = None
+                
+                # حفظ في قاعدة البيانات
+                cursor = conn.execute("""
+                    INSERT INTO scheduled_tasks 
+                    (task_name, task_type, target, content_type, file_id, text, entities,
+                     run_time, start_date, end_date, days_of_week, is_active, validation_status, created_by)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'validated', ?)
+                """, (
+                    schedule_name,
+                    schedule_type,
+                    target,
+                    msg_data.get('type', 'text'),
+                    msg_data.get('file_id'),
+                    msg_data.get('text', ''),
+                    msg_data.get('entities'),
+                    time_str,
+                    start_date,
+                    end_date,
+                    ','.join(data.get('selected_days', [])) if schedule_type == 'weekly' else None,
+                    message.from_user.id
+                ))
+                task_ids.append(cursor.lastrowid)
             
-            if scheduled_datetime <= now:
-                await message.answer(
-                    "⚠️ <b>خطأ: الوقت المحدد قد مضى!</b>\n\n"
-                    "لا يمكن حفظ جدولة في الماضي.\n"
-                    "يرجى إنشاء جدولة جديدة بوقت صحيح.",
-                    parse_mode="HTML"
-                )
-                await state.clear()
-                keyboard = get_admin_kb() if db.is_admin(message.from_user.id) else get_main_kb(message.from_user.id, False)
-                await message.answer("تم الإلغاء.", reply_markup=keyboard)
-                return
-        except ValueError:
-            pass
-    
-    conn = db.get_connection()
-    cursor = conn.execute("""
-        INSERT INTO scheduled_tasks 
-        (task_name, task_type, target, content_type, file_id, text, 
-         run_time, days_of_week, end_date, is_active, validation_status, start_date)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 'validated', date('now'))
-    """, (schedule_name, schedule_type, target, content_type, file_id, text,
-          time_str, days, once_date))
-    
-    task_id = cursor.lastrowid
-    conn.commit()
-    conn.close()
-    
-    # رسالة التأكيد
-    confirm_msg = f"✅ <b>تم حفظ الجدول بنجاح!</b>\n\n" \
-                  f"🆔 رقم الجدول: <code>{task_id}</code>\n" \
-                  f"⏰ الوقت: <code>{time_str}</code>\n"
-    
-    if schedule_type == 'once' and once_date:
-        confirm_msg += f"📅 التاريخ: <code>{once_date}</code>\n"
-    
-    confirm_msg += f"📅 النوع: <code>{schedule_type}</code>\n\n" \
-                   f"💡 <i>سيبدأ التنفيذ تلقائياً في الموعد المحدد</i>"
-    
-    await message.answer(confirm_msg, parse_mode="HTML")
-    
-    await state.clear()
-    is_admin = db.is_admin(message.from_user.id)
-    await message.answer("تم!", reply_markup=get_main_kb(message.from_user.id, is_admin))
+            conn.commit()
+            
+            # رسالة نجاح
+            success_msg = f"✅ <b>تم حفظ الجدولة بنجاح!</b>\n\n"
+            success_msg += f"📋 عدد الرسائل المجدولة: <code>{len(sch_messages)}</code>\n"
+            success_msg += f"⏰ الوقت: <code>{time_str}</code>\n"
+            
+            if schedule_type == 'once' and once_date:
+                success_msg += f"📅 التاريخ: <code>{once_date}</code>\n"
+                success_msg += f"📆 النوع: <b>مرة واحدة</b>\n"
+            elif schedule_type == 'daily':
+                success_msg += f"📆 النوع: <b>يومي</b>\n"
+            elif schedule_type == 'weekly':
+                success_msg += f"📆 النوع: <b>أيام محددة</b>\n"
+                success_msg += f"📅 الأيام: <code>{', '.join(data.get('selected_days', []))}</code>\n"
+            
+            success_msg += f"🎯 الهدف: <code>{target}</code>\n"
+            success_msg += f"🆔 أرقام الجداول: <code>{', '.join(map(str, task_ids))}</code>\n\n"
+            success_msg += f"💡 <i>سيتم إرسال الرسائل تلقائياً في الموعد المحدد</i>"
+            
+            await message.answer(success_msg, parse_mode="HTML")
+            
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"Error saving schedule: {e}")
+            await message.answer(f"❌ خطأ في حفظ الجدولة: {e}")
+        finally:
+            conn.close()
+        
+        await state.clear()
+        db = get_db()
+        is_admin = db.is_admin(message.from_user.id)
+        await message.answer("تم الحفظ بنجاح!", reply_markup=get_main_kb(message.from_user.id, is_admin))
+    else:
+        await message.answer("⚠️ الرجاء اختيار أحد الخيارات المتاحة")
 
 # ==========================================
 # عرض الجداول النشطة
 # ==========================================
 
 # زر الجداول النشطة: يعرض الجداول النشطة فعلياً من قاعدة البيانات
-@router.message(F.text.in_(["الجداول النشطة", "📋 الجداول النشطة", "⏰ الجداول النشطة"]))
+@router.message(F.text.in_(["الجداول النشطة", "📋 الجداول النشطة", "⏰ الجداول النشطة", "عرض الجداول النشطة"]))
 async def btn_active_schedules(message: types.Message, state: FSMContext = None):
+    """عرض الجداول النشطة مع إمكانية التعديل والحذف"""
     db = get_db()
     if not db.is_admin(message.from_user.id):
         await message.answer("❌ هذه الميزة للمشرفين فقط.")
         return
 
     conn = db.get_connection()
+    
+    # جلب الجداول النشطة التي لم ترسل بعد (last_run IS NULL) أو الجداول المتكررة
     tasks = conn.execute("""
         SELECT id, task_name, task_type, run_time, target, 
-               last_run, run_count, total_targets, start_date, end_date, days_of_week
+               last_run, run_count, total_targets, start_date, end_date, days_of_week,
+               content_type, text, file_id
         FROM scheduled_tasks 
-        WHERE is_active = 1
-        ORDER BY id DESC
-        LIMIT 20
+        WHERE is_active = 1 
+        AND (last_run IS NULL OR task_type IN ('daily', 'weekly', 'specific_days'))
+        ORDER BY 
+            CASE 
+                WHEN last_run IS NULL THEN 0 
+                ELSE 1 
+            END,
+            id DESC
+        LIMIT 50
     """).fetchall()
+    
     conn.close()
 
     if not tasks:
-        await message.answer("لا توجد جداول نشطة حالياً.")
+        keyboard = types.ReplyKeyboardMarkup(keyboard=[
+            [types.KeyboardButton(text="📅 جدولة رسالة جديدة")],
+            [types.KeyboardButton(text="رجوع"), types.KeyboardButton(text="القائمة الرئيسية")]
+        ], resize_keyboard=True)
+        await message.answer(
+            "📭 <b>لا توجد جداول نشطة حالياً</b>\n\n"
+            "يمكنك إنشاء جدولة جديدة من لوحة التحكم.",
+            reply_markup=keyboard,
+            parse_mode="HTML"
+        )
         return
 
     # أسماء الأنواع بالعربية
     type_names = {
-        'daily': 'يومي ⏰',
-        'specific_days': 'أيام محددة 📅',
-        'weekly': 'أسبوعي 📆',
-        'once': 'مرة واحدة 🔔',
-        'one_time': 'مرة واحدة 🔔'
+        'daily': '📅 يومي',
+        'specific_days': '📆 أيام محددة',
+        'weekly': '📆 أسبوعي',
+        'once': '🔔 مرة واحدة (لم ترسل بعد)',
+        'one_time': '🔔 مرة واحدة'
     }
     target_names = {
         'all': 'الجميع 🌐',
@@ -6415,247 +6419,223 @@ async def btn_active_schedules(message: types.Message, state: FSMContext = None)
         'channels_groups': 'القنوات والمجموعات'
     }
 
-    text = """╔═══════════════════════╗
-║ 📋 <b>الجداول النشطة</b> ║
-╚═══════════════════════╝
+    text = """╔══════════════════════════════════╗
+║ 📋 <b>الجداول النشطة (في الانتظار)</b> ║
+╚══════════════════════════════════╝
 
 """
+    
+    # إنشاء أزرار التحكم لكل جدول
+    keyboard_buttons = []
+    
     for task in tasks:
-        tid, name, ttype, time, target, last_run, run_count, total_targets, start_date, end_date, days_of_week = task
+        tid, name, ttype, time, target, last_run, run_count, total_targets, start_date, end_date, days_of_week, content_type, task_text, file_id = task
+        
         ttype_ar = type_names.get(ttype, ttype)
         target_ar = target_names.get(target, target)
+        
+        # تحديد الحالة
+        if last_run:
+            status = "✅ تم الإرسال (متكرر)"
+        else:
+            status = "⏳ في الانتظار"
+        
         text += f"""━━━━━━━━━━━━━━━━━━━━━━
 <b>🆔 رقم الجدول:</b> <code>{tid}</code>
-<b>📛 الاسم:</b> {name}
+<b>📛 الاسم:</b> {name or 'بدون اسم'}
+<b>📊 الحالة:</b> {status}
 <b>📆 النوع:</b> {ttype_ar}
 <b>🕐 الوقت:</b> <code>{time}</code>
+<b>📅 التاريخ:</b> <code>{start_date or 'غير محدد'}</code>
 <b>🎯 الهدف:</b> {target_ar}
-<b>📅 من:</b> <code>{start_date}</code>  <b>إلى:</b> <code>{end_date or 'بدون نهاية'}</code>
-<b>📊 مرات التنفيذ:</b> <code>{run_count}</code>
-<b>👥 المستهدفين:</b> <code>{total_targets}</code>
+<b>📦 المحتوى:</b> {content_type}
 """
-        if days_of_week:
-            text += f"<b>أيام الأسبوع:</b> <code>{days_of_week}</code>\n"
-
-    text += f"""\n━━━━━━━━━━━━━━━━━━━━━━
-<b>📊 الإجمالي:</b> <code>{len(tasks)}</code> جدول نشط
-💡 الجداول لمرة واحدة تُحذف تلقائياً بعد التنفيذ
-"""
-
-    # أزرار تحكم (حذف الجدول)
-    keyboard_buttons = []
-    for task in tasks[:10]:
-        tid = task[0]
-        keyboard_buttons.append([types.InlineKeyboardButton(text=f"🗑️ حذف #{tid}", callback_data=f"del_schedule_{tid}")])
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons) if keyboard_buttons else None
-
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-    db = get_db()
-    if not db.is_admin(message.from_user.id):
-        await message.answer("❌ هذه الميزة للمشرفين فقط.")
-        return
-
-    conn = db.get_connection()
-    tasks = conn.execute("""
-        SELECT id, task_name, task_type, run_time, target, 
-               last_run, run_count, total_targets, start_date, end_date, days_of_week
-        FROM scheduled_tasks 
-        WHERE is_active = 1
-        ORDER BY id DESC
-        LIMIT 20
-    """).fetchall()
-    conn.close()
-
-    if not tasks:
-        await message.answer("لا توجد جداول نشطة حالياً.")
-        return
-
-    # أسماء الأنواع بالعربية
-    type_names = {
-        'daily': 'يومي ⏰',
-        'specific_days': 'أيام محددة 📅',
-        'weekly': 'أسبوعي 📆',
-        'once': 'مرة واحدة 🔔',
-        'one_time': 'مرة واحدة 🔔'
-    }
-    target_names = {
-        'all': 'الجميع 🌐',
-        'users': 'المستخدمين 👥',
-        'groups': 'المجموعات 👥',
-        'channels': 'القنوات 📢',
-        'channels_groups': 'القنوات والمجموعات'
-    }
-
-    text = """╔═══════════════════════╗
-║ 📋 <b>الجداول النشطة</b> ║
-╚═══════════════════════╝
-
-"""
-    for task in tasks:
-        tid, name, ttype, time, target, last_run, run_count, total_targets, start_date, end_date, days_of_week = task
-        ttype_ar = type_names.get(ttype, ttype)
-        target_ar = target_names.get(target, target)
-        text += f"""━━━━━━━━━━━━━━━━━━━━━━
-<b>🆔 رقم الجدول:</b> <code>{tid}</code>
-<b>📛 الاسم:</b> {name}
-<b>📆 النوع:</b> {ttype_ar}
-<b>🕐 الوقت:</b> <code>{time}</code>
-<b>🎯 الهدف:</b> {target_ar}
-<b>📅 من:</b> <code>{start_date}</code>  <b>إلى:</b> <code>{end_date or 'بدون نهاية'}</code>
-<b>📊 مرات التنفيذ:</b> <code>{run_count}</code>
-<b>👥 المستهدفين:</b> <code>{total_targets}</code>
-"""
-        if days_of_week:
-            text += f"<b>أيام الأسبوع:</b> <code>{days_of_week}</code>\n"
-
-    text += f"""\n━━━━━━━━━━━━━━━━━━━━━━
-<b>📊 الإجمالي:</b> <code>{len(tasks)}</code> جدول نشط
-💡 الجداول لمرة واحدة تُحذف تلقائياً بعد التنفيذ
-"""
-
-    # أزرار تحكم (حذف الجدول)
-    keyboard_buttons = []
-    for task in tasks[:10]:
-        tid = task[0]
-        keyboard_buttons.append([types.InlineKeyboardButton(text=f"🗑️ حذف #{tid}", callback_data=f"del_schedule_{tid}")])
-    keyboard = types.InlineKeyboardMarkup(inline_keyboard=keyboard_buttons) if keyboard_buttons else None
-
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-    if not get_db().is_admin(message.from_user.id): 
-        # ...existing code...
-        return
-    db = get_db()
-    conn = db.get_connection()
-    # ...existing code...
-    # لا تغيير في منطق الجداول النشطة
-    # ...existing code...
-    if not get_db().is_admin(message.from_user.id): return
-    
-    db = get_db()
-    conn = db.get_connection()
-    
-    # جلب الجداول النشطة مع إحصائيات متقدمة
-    tasks = conn.execute("""
-        SELECT id, task_name, task_type, run_time, target, 
-               last_run, run_count, total_targets, start_date, end_date, days_of_week
-        FROM scheduled_tasks 
-        WHERE is_active = 1
-        ORDER BY id DESC
-        LIMIT 20
-    """).fetchall()
-    conn.close()
-    
-    if not tasks:
-        await message.answer("📭 لا توجد جداول نشطة حالياً")
-        return
-    
-    # أسماء الأنواع بالعربية
-    type_names = {
-        'daily': 'يومي ⏰',
-        'specific_days': 'أيام محددة 📅',
-        'weekly': 'أسبوعي 📆',
-        'once': 'مرة واحدة 🔔',
-        'one_time': 'مرة واحدة 🔔'
-    }
-    
-    target_names = {
-        'all': 'الجميع 🌐',
-        'users': 'المستخدمين 👥',
-        'groups': 'المجموعات 👥',
-        'channels': 'القنوات 📢'
-    }
-    
-    text = """╔═══════════════════════╗
-║ 📋 <b>الجداول النشطة</b> ║
-╚═══════════════════════╝
-
-"""
-    
-    for task in tasks:
-        task_id, name, task_type, run_time, target, last_run, run_count, total_targets, start_date, end_date, days_of_week = task
+        if task_text:
+            preview = task_text[:30] + "..." if len(task_text) > 30 else task_text
+            text += f"<b>📝 النص:</b> {preview}\n"
         
-        type_display = type_names.get(task_type, task_type)
-        target_display = target_names.get(target, target)
-        
-        text += f"🔹 <b>#{task_id}</b> - {name or 'بدون اسم'}\n"
-        text += f"   📊 النوع: {type_display}\n"
-        text += f"   ⏰ الوقت: <code>{run_time}</code>\n"
-        text += f"   🎯 الهدف: {target_display}\n"
+        if days_of_week:
+            text += f"<b>📅 أيام الأسبوع:</b> <code>{days_of_week}</code>\n"
         
         if last_run:
-            text += f"   📅 آخر تشغيل: <code>{last_run[:16]}</code>\n"
-        else:
-            text += f"   📅 لم يتم التشغيل بعد\n"
-        
-        text += f"   🔄 عدد مرات التشغيل: <code>{run_count or 0}</code>\n"
-        text += f"   ✅ إجمالي المستهدفين: <code>{total_targets or 0}</code>\n"
-        
-        if end_date:
-            if task_type in ['once', 'one_time']:
-                text += f"   📅 موعد التنفيذ: <code>{end_date}</code>\n"
-            else:
-                text += f"   ⏳ ينتهي في: <code>{end_date}</code>\n"
+            text += f"<b>📤 آخر إرسال:</b> <code>{last_run[:16]}</code>\n"
         
         text += "\n"
+        
+        # إضافة أزرار التحكم لهذا الجدول
+        row = []
+        if not last_run:  # إذا لم يرسل بعد، نسمح بالتعديل
+            row.append(InlineKeyboardButton(text=f"✏️ تعديل #{tid}", callback_data=f"edit_sch_{tid}"))
+        row.append(InlineKeyboardButton(text=f"🗑️ حذف #{tid}", callback_data=f"del_schedule_{tid}"))
+        if len(row) == 2:
+            keyboard_buttons.append(row)
+        else:
+            keyboard_buttons.append(row)
     
-    text += f"""━━━━━━━━━━━━━━━━━━━━━━
-
-<b>📊 الإحصائيات:</b>
-• إجمالي الجداول: <code>{len(tasks)}</code>
-• تعمل تلقائياً كل دقيقة ✅
-
-💡 <i>الجداول لمرة واحدة تُحذف تلقائياً بعد التنفيذ
-الجداول المنتهية تُحذف تلقائياً</i>
-"""
+    # إضافة أزرار عامة
+    keyboard_buttons.append([
+        InlineKeyboardButton(text="🔄 تحديث القائمة", callback_data="refresh_schedules"),
+        InlineKeyboardButton(text="➕ جدولة جديدة", callback_data="new_schedule")
+    ])
+    keyboard_buttons.append([
+        InlineKeyboardButton(text="❌ حذف كل الجداول", callback_data="delete_all_schedules")
+    ])
     
-    # أزرار للتحكم في الجداول
-    keyboard_buttons = []
-    for task in tasks[:10]:  # أول 10 جداول فقط
-        task_id = task[0]
-        task_name = task[1] or f"جدولة #{task_id}"
-        keyboard_buttons.append([
-            InlineKeyboardButton(
-                text=f"❌ حذف: {task_name[:30]}",
-                callback_data=f"del_schedule_{task_id}"
-            )
-        ])
+    text += f"""\n━━━━━━━━━━━━━━━━━━━━━━
+<b>📊 الإجمالي:</b> <code>{len(tasks)}</code> جدول نشط
+💡 الجداول التي تم إرسالها مرة واحدة تُحذف تلقائياً
+💡 الجداول المتكررة تظهر حتى تقوم بحذفها"""
     
-    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons) if keyboard_buttons else None
+    keyboard = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
     
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
-# Handler لحذف جدولة
-# 2. Handler حذف الجدولة (يبقى كما هو غالباً)
-@router.callback_query(F.data.startswith("del_schedule_"))
-async def cb_delete_schedule(callback: types.CallbackQuery):
+@router.callback_query(F.data.startswith("edit_sch_"))
+async def cb_edit_schedule(callback: types.CallbackQuery, state: FSMContext):
+    """تعديل جدولة موجودة"""
     task_id = int(callback.data.split("_")[2])
     db = get_db()
     conn = db.get_connection()
-    conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (task_id,))
-    conn.commit()
+    
+    task = conn.execute("""
+        SELECT id, task_name, task_type, run_time, target, start_date, end_date, days_of_week, text
+        FROM scheduled_tasks WHERE id = ?
+    """, (task_id,)).fetchone()
+    
     conn.close()
-    await callback.answer("✅ تم حذف الجدولة", show_alert=True)
+    
+    if not task:
+        await callback.answer("❌ الجدول غير موجود!", show_alert=True)
+        return
+    
+    tid, name, ttype, time, target, start_date, end_date, days, text = task
+    
+    # حفظ في state للتعديل
+    await state.update_data(
+        editing_task_id=tid,
+        sch_type=ttype,
+        sch_time=time,
+        sch_target=target,
+        sch_once_date=start_date if ttype == 'once' else None,
+        selected_days=days.split(',') if days else []
+    )
+    
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⏰ تعديل الوقت", callback_data=f"edit_time_{tid}")],
+        [InlineKeyboardButton(text="📅 تعديل التاريخ", callback_data=f"edit_date_{tid}") if ttype == 'once' else InlineKeyboardButton(text="📅 تعديل الأيام", callback_data=f"edit_days_{tid}")],
+        [InlineKeyboardButton(text="🎯 تعديل الهدف", callback_data=f"edit_target_{tid}")],
+        [InlineKeyboardButton(text="📝 تعديل المحتوى", callback_data=f"edit_content_{tid}")],
+        [InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel_edit")]
+    ])
+    
     await callback.message.edit_text(
-        callback.message.text + f"\n\n❌ <b>تم حذف الجدولة #{task_id}</b>",
+        f"✏️ <b>تعديل الجدولة #{tid}</b>\n\n"
+        f"النوع: {ttype}\n"
+        f"الوقت الحالي: <code>{time}</code>\n"
+        f"التاريخ: <code>{start_date or 'غير محدد'}</code>\n\n"
+        f"اختر ما تريد تعديله:",
+        reply_markup=keyboard,
         parse_mode="HTML"
     )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("edit_time_"))
+async def cb_edit_time(callback: types.CallbackQuery, state: FSMContext):
+    """تعديل وقت الجدولة"""
+    await callback.message.answer(
+        "⏰ <b>أدخل الوقت الجديد</b>\n\n"
+        "الصيغة: <code>HH:MM</code>\n"
+        "مثال: <code>09:00</code> أو <code>15:30</code>",
+        parse_mode="HTML",
+        reply_markup=get_cancel_kb()
+    )
+    await state.set_state(Form.sch_edit_time)
+    await callback.answer()
+
+@router.message(Form.sch_edit_time)
+async def process_edit_time(message: types.Message, state: FSMContext):
+    """حفظ الوقت الجديد"""
+    if message.text == "إلغاء":
+        await state.clear()
+        await btn_active_schedules(message)
+        return
+    
+    import re
+    if not re.match(r'^([0-1]?[0-9]|2[0-3]):([0-5][0-9])$', message.text):
+        await message.answer("⚠️ صيغة خاطئة! استخدم: HH:MM")
+        return
+    
+    data = await state.get_data()
+    task_id = data.get('editing_task_id')
+    
+    db = get_db()
+    conn = db.get_connection()
+    conn.execute("UPDATE scheduled_tasks SET run_time = ? WHERE id = ?", (message.text, task_id))
+    conn.commit()
+    conn.close()
+    
+    await message.answer(f"✅ تم تحديث الوقت إلى: <code>{message.text}</code>", parse_mode="HTML")
+    await state.clear()
+    await btn_active_schedules(message)
+
+@router.callback_query(F.data.startswith("del_schedule_"))
+async def cb_delete_schedule(callback: types.CallbackQuery):
     """حذف جدولة محددة"""
     task_id = int(callback.data.split("_")[2])
     
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ نعم، احذف", callback_data=f"confirm_del_sch_{task_id}")],
+        [InlineKeyboardButton(text="❌ لا، إلغاء", callback_data="cancel_delete")]
+    ])
+    
+    await callback.message.edit_text(
+        f"⚠️ <b>تأكيد الحذف</b>\n\n"
+        f"هل أنت متأكد من حذف الجدولة #{task_id}؟\n\n"
+        f"❌ هذا الإجراء لا يمكن التراجع عنه!",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("confirm_del_sch_"))
+async def cb_confirm_delete_schedule(callback: types.CallbackQuery):
+    """تأكيد حذف الجدولة"""
+    task_id = int(callback.data.split("_")[3])
+    
     db = get_db()
     conn = db.get_connection()
-    
-    # حذف الجدولة
-    conn.execute("DELETE FROM scheduled_tasks WHERE id=?", (task_id,))
+    conn.execute("DELETE FROM scheduled_tasks WHERE id = ?", (task_id,))
     conn.commit()
     conn.close()
     
     await callback.answer("✅ تم حذف الجدولة", show_alert=True)
     await callback.message.edit_text(
-        callback.message.text + f"\n\n❌ <b>تم حذف الجدولة #{task_id}</b>",
+        f"🗑️ <b>تم حذف الجدولة #{task_id} بنجاح</b>",
         parse_mode="HTML"
     )
+    
+    # إعادة عرض القائمة
+    await btn_active_schedules(callback.message)
 
+@router.callback_query(F.data == "refresh_schedules")
+async def cb_refresh_schedules(callback: types.CallbackQuery):
+    """تحديث قائمة الجداول"""
+    await callback.answer("🔄 جاري التحديث...")
+    await callback.message.delete()
+    await btn_active_schedules(callback.message)
+
+@router.callback_query(F.data == "new_schedule")
+async def cb_new_schedule(callback: types.CallbackQuery, state: FSMContext):
+    """إنشاء جدولة جديدة من الزر"""
+    await callback.message.delete()
+    await btn_schedule(callback.message, state)
+
+@router.callback_query(F.data == "cancel_delete")
+async def cb_cancel_delete(callback: types.CallbackQuery):
+    """إلغاء الحذف"""
+    await callback.answer("تم إلغاء الحذف")
+    await btn_active_schedules(callback.message)
+    
 # ==========================================
 # الإحصائيات
 # ==========================================
@@ -7124,7 +7104,7 @@ async def cb_toggle_service(callback: types.CallbackQuery):
     except Exception as e:
         await callback.answer()
 
-@router.message(F.text == "�🔄 تصفير الورد")
+@router.message(F.text == " 🔄 تصفير الورد")
 
 @router.message(F.text == "إذاعة لآفاق")
 async def btn_broadcast_afaq(message: types.Message, state: FSMContext):
@@ -7551,6 +7531,19 @@ async def execute_scheduled_task(task_id, target, content_type, file_id, text, e
     try:
         db = get_db()
         
+        # Ensure we have task metadata for logging (task_name, created_by)
+        task_name = f"scheduled_{task_id}"
+        task_creator = 0
+        try:
+            conn_meta = db.get_connection()
+            meta = conn_meta.execute("SELECT task_name, created_by FROM scheduled_tasks WHERE id=?", (task_id,)).fetchone()
+            conn_meta.close()
+            if meta:
+                task_name = meta[0] or task_name
+                task_creator = meta[1] or task_creator
+        except Exception:
+            pass
+        
         # 🎯 جلب الأهداف بدقة
         ids = db.get_broadcast_targets(target, only_active=True)
         
@@ -7672,6 +7665,17 @@ async def execute_scheduled_task(task_id, target, content_type, file_id, text, e
         conn.commit()
         conn.close()
         
+        # تسجيل نتائج الإذاعة المجمعة في جدول broadcast_history عبر دالة مساعدة
+        try:
+            preview = ''
+            if text:
+                preview = (text[:200] + '...') if len(text) > 200 else text
+            elif file_id:
+                preview = f"file:{file_id}"
+            db.log_broadcast(name=task_name, preview=preview, target_type=target, success=success_count, failed=failed_count, admin_id=task_creator or 0, service='scheduled')
+        except Exception as e:
+            logger.debug(f"Failed to log scheduled broadcast summary: {e}")
+
         # تحديث الإحصائيات وحذف الجداول المنتهية
         db.mark_task_executed(task_id, success_count)
         logger.info(f"Task #{task_id} completed: {success_count} success, {failed_count} failed")
@@ -7754,29 +7758,30 @@ async def process_due_alarms(rows):
 # ⚡ أزرار الرجوع والقائمة الرئيسية - يجب أن تكون قبل user_tracker
 # ==========================================
 
-@router.message(F.text.in_(["رجوع", "◀️ رجوع", "رجوع للقائمة الرئيسية", "رجوع للوحة التحكم", "رجوع لإدارة آفاق", "رجوع لإدارة المنبهات"]))
+@router.message(F.text.in_(["رجوع", "◀️ رجوع", "رجوع للقائمة الرئيسية", "رجوع للوحة التحكم", "رجوع لإدارة آفاق", "رجوع لإدارة المنبهات", "رجوع لإدارة الورد"]))
 async def btn_back(message: types.Message, state: FSMContext):
-    """الرجوع للقائمة السابقة - handler موحد لجميع أزرار الرجوع"""
-    await state.clear()
+    """الرجوع للقائمة السابقة - handler موحد ومحسن"""
+    await state.clear()  # مسح أي state نشط دائماً
     
     db = get_db()
     is_admin = db.is_admin(message.from_user.id)
     
-    # العودة حسب نوع الزر
+    # تحديد الوجهة بناءً على نص الزر
     if "للوحة التحكم" in message.text or "لإدارة" in message.text:
         if is_admin:
             await btn_admin_panel(message, state)
         else:
-            await message.answer("القائمة الرئيسية:", reply_markup=get_main_kb(message.from_user.id, False))
+            await cmd_start(message)
     elif "للقائمة الرئيسية" in message.text:
-        await message.answer("القائمة الرئيسية:", reply_markup=get_main_kb(message.from_user.id, is_admin))
+        await cmd_start(message)
     else:
-        # زر رجوع عادي
+        # زر رجوع عادي - العودة للوحة التحكم إذا كان مشرفاً، وإلا للقائمة الرئيسية
         if is_admin:
+            # إذا كان في قسم إدارة آفاق/منبهات/ورد، نرجع للوحة التحكم
             await btn_admin_panel(message, state)
         else:
-            await message.answer("القائمة الرئيسية:", reply_markup=get_main_kb(message.from_user.id, False))
-
+            await cmd_start(message)
+            
 @router.message(F.text == "🎯 التحكم بالأزرار")
 async def btn_buttons_manager(message: types.Message):
     """لوحة التحكم الشاملة بجميع أزرار البوت"""
@@ -8185,7 +8190,7 @@ async def btn_admin_management(message: types.Message):
 
 @router.message(F.text.in_(["القنوات والمجموعات", "📣 القنوات والمجموعات"]))
 async def btn_channels_groups_direct(message: types.Message):
-    """زر القنوات والمجموعات - عرض الروابط"""
+    """زر القنوات والمجموعات - عرض الروابط والتحكم البسيط فقط"""
     if not get_db().is_admin(message.from_user.id):
         await message.answer("⛔ هذا الأمر للمشرفين فقط")
         return
@@ -8195,423 +8200,103 @@ async def btn_channels_groups_direct(message: types.Message):
     db = get_db()
     conn = db.get_connection()
     
+    # جلب القنوات النشطة
     channels = conn.execute("""
-        SELECT chat_id, title, username, invite_link 
+        SELECT chat_id, title, username, invite_link, status
         FROM chats 
-        WHERE type='channel' AND status='active'
-        ORDER BY title
+        WHERE type='channel'
+        ORDER BY status DESC, title ASC
     """).fetchall()
     
+    # جلب المجموعات النشطة
     groups = conn.execute("""
-        SELECT chat_id, title, username, invite_link 
+        SELECT chat_id, title, username, invite_link, status
         FROM chats 
-        WHERE type IN ('group', 'supergroup') AND status='active'
-        ORDER BY title
+        WHERE type IN ('group', 'supergroup')
+        ORDER BY status DESC, title ASC
     """).fetchall()
     
     conn.close()
+    
+    # حساب الإحصائيات
+    active_channels = [c for c in channels if c[4] == 'active']
+    active_groups = [g for g in groups if g[4] == 'active']
     
     text = f"""╔═════════════════════════╗
 ║ 📢 <b>القنوات والمجموعات</b> ║
 ╚═════════════════════════╝
 
 <b>📊 الإحصائيات:</b>
-• قنوات نشطة: <code>{len(channels)}</code>
-• مجموعات نشطة: <code>{len(groups)}</code>
+• القنوات: <code>{len(active_channels)}/{len(channels)}</code> نشطة
+• المجموعات: <code>{len(active_groups)}/{len(groups)}</code> نشطة
+• الإجمالي: <code>{len(active_channels) + len(active_groups)}</code> نشط
 
 ━━━━━━━━━━━━━━━━━━━━━━
 
 """
     
+    # عرض القنوات
     if channels:
-        text += "📢 <b>القنوات:</b>\n\n"
-        for ch_id, title, username, invite in channels:
-            link = f"https://t.me/{username}" if username else (invite or "غير متوفر")
-            text += f"• <b>{title}</b>\n  🔗 {link}\n\n"
+        text += "<b>📢 القنوات:</b>\n\n"
+        for ch_id, title, username, invite_link, status in channels:
+            if status != 'active':
+                continue  # عرض النشطة فقط في القائمة الرئيسية
+                
+            name = title or "بدون اسم"
+            emoji = "✅" if status == 'active' else "❌"
+            
+            # إنشاء الرابط
+            if username:
+                link = f"https://t.me/{username}"
+                text += f"{emoji} <a href='{link}'>{name}</a>\n"
+            elif invite_link:
+                text += f"{emoji} <a href='{invite_link}'>{name}</a>\n"
+            else:
+                text += f"{emoji} {name} (ID: <code>{ch_id}</code>)\n"
+        
+        if len(channels) > len(active_channels):
+            text += f"\n<i>... و {len(channels) - len(active_channels)} قناة غير نشطة</i>\n"
     else:
-        text += "⚠️ لا توجد قنوات نشطة\n"
+        text += "<b>📢 القنوات:</b> لا توجد قنوات مسجلة\n\n"
     
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n\n"
+    text += "\n━━━━━━━━━━━━━━━━━━━━━━\n\n"
     
+    # عرض المجموعات
     if groups:
-        text += "👥 <b>المجموعات:</b>\n\n"
-        for g_id, title, username, invite in groups:
-            link = f"https://t.me/{username}" if username else (invite or "غير متوفر")
-            text += f"• <b>{title}</b>\n  🔗 {link}\n\n"
+        text += "<b>👥 المجموعات:</b>\n\n"
+        for g_id, title, username, invite_link, status in groups:
+            if status != 'active':
+                continue
+                
+            name = title or "بدون اسم"
+            emoji = "✅" if status == 'active' else "❌"
+            
+            if username:
+                link = f"https://t.me/{username}"
+                text += f"{emoji} <a href='{link}'>{name}</a>\n"
+            elif invite_link:
+                text += f"{emoji} <a href='{invite_link}'>{name}</a>\n"
+            else:
+                text += f"{emoji} {name} (ID: <code>{g_id}</code>)\n"
+        
+        if len(groups) > len(active_groups):
+            text += f"\n<i>... و {len(groups) - len(active_groups)} مجموعة غير نشطة</i>\n"
     else:
-        text += "⚠️ لا توجد مجموعات نشطة\n"
+        text += "<b>👥 المجموعات:</b> لا توجد مجموعات مسجلة\n\n"
     
-    text += "━━━━━━━━━━━━━━━━━━━━━━\n"
-    text += "💡 يمكن للبوت النشر في جميع هذه القنوات والمجموعات"
+    text += "\n━━━━━━━━━━━━━━━━━━━━━━\n"
+    text += "💡 <b>نصيحة:</b> لإضافة قناة/مجموعة جديدة، أضف البوت كمشرف فيها"
     
-    keyboard = types.ReplyKeyboardMarkup(keyboard=[
-        [types.KeyboardButton(text="رجوع"), types.KeyboardButton(text="القائمة الرئيسية")]
-    ], resize_keyboard=True)
+    # أزرار التحكم البسيطة فقط (بدون جلب أو استيراد)
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 تحديث القائمة", callback_data="refresh_channels_list")],
+        [InlineKeyboardButton(text="📊 إحصائيات مفصلة", callback_data="channels_stats_detailed")],
+        [InlineKeyboardButton(text="📋 تصدير القائمة", callback_data="export_channels_list")],
+        [InlineKeyboardButton(text="🗑️ تنظيف غير النشط", callback_data="cleanup_inactive_chats")]
+    ])
     
     await wait_msg.delete()
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML", disable_web_page_preview=True)
-
-# === تم حذف جميع أزرار: جمع IDs + تصحيح أنواع الشات + فحص صلاحيات البوت ===
-
-# حالة FSM لاستيراد IDs
-    
-    wait_msg = await message.answer("⏳ جاري البحث عن المستخدمين والقنوات القديمة...")
-    
-    try:
-        conn = get_db().get_connection()
-        
-        # جمع جميع IDs من broadcast_history (العمود: target)
-        broadcast_ids = set()
-        try:
-            cursor = conn.execute("SELECT DISTINCT target FROM broadcast_history WHERE target IS NOT NULL")
-            for row in cursor.fetchall():
-                if row[0]:
-                    broadcast_ids.add(row[0])
-        except Exception as e:
-            logger.warning(f"⚠️ Error reading broadcast_history: {e}")
-        
-        # جمع IDs من activity_log (العمود: entity_id)
-        activity_ids = set()
-        try:
-            cursor = conn.execute("SELECT DISTINCT entity_id FROM activity_log WHERE entity_id IS NOT NULL")
-            for row in cursor.fetchall():
-                if row[0]:
-                    activity_ids.add(row[0])
-        except Exception as e:
-            logger.warning(f"⚠️ Error reading activity_log: {e}")
-        
-        # جمع IDs من contact_messages
-        contact_ids = set()
-        try:
-            cursor = conn.execute("SELECT DISTINCT from_user_id FROM contact_messages WHERE from_user_id IS NOT NULL")
-            for row in cursor.fetchall():
-                if row[0]:
-                    contact_ids.add(row[0])
-        except:
-            pass
-        
-        # دمج كل IDs
-        all_ids = broadcast_ids | activity_ids | contact_ids
-        
-        logger.info(f"🔍 Found {len(all_ids)} unique IDs from history")
-        
-        # فحص أي منها غير مسجل
-        new_users = 0
-        new_chats = 0
-        errors = 0
-        
-        for uid in all_ids:
-            try:
-                if uid > 0:  # User
-                    # فحص إذا موجود
-                    existing = conn.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
-                    if not existing:
-                        # تسجيل المستخدم
-                        conn.execute("""
-                            INSERT INTO users (user_id, username, join_date, last_activity, status)
-                            VALUES (?, 'legacy_user', datetime('now'), datetime('now'), 'active')
-                        """, (uid,))
-                        new_users += 1
-                        logger.info(f"✨ Registered legacy user: {uid}")
-                else:  # Chat
-                    # فحص إذا موجود
-                    existing = conn.execute("SELECT chat_id FROM chats WHERE chat_id=?", (uid,)).fetchone()
-                    if not existing:
-                        try:
-                            # محاولة جلب معلومات الشات
-                            chat_info = await bot.get_chat(uid)
-                            chat_type = chat_info.type
-                            chat_title = chat_info.title or "Unknown"
-                            
-                            conn.execute("""
-                                INSERT INTO chats (chat_id, type, title, join_date, last_activity, status)
-                                VALUES (?, ?, ?, datetime('now'), datetime('now'), 'active')
-                            """, (uid, chat_type, chat_title))
-                            new_chats += 1
-                            logger.info(f"✨ Registered legacy chat: {uid} ({chat_type}: {chat_title})")
-                        except Exception as e:
-                            # إذا فشل جلب المعلومات، تسجيل بمعلومات أساسية
-                            conn.execute("""
-                                INSERT INTO chats (chat_id, type, title, join_date, last_activity, status)
-                                VALUES (?, 'unknown', 'Legacy Chat', datetime('now'), datetime('now'), 'inactive')
-                            """, (uid,))
-                            new_chats += 1
-                            logger.warning(f"⚠️ Registered legacy chat with basic info: {uid}")
-            except Exception as e:
-                errors += 1
-                logger.error(f"❌ Error processing ID {uid}: {e}")
-        
-        conn.commit()
-        
-        # إحصائيات محدثة
-        stats = get_db().get_live_stats()
-        
-        result_text = f"""🔍 <b>نتائج جمع IDs:</b>
-
-📊 <b>IDs المكتشفة من السجلات:</b>
-• إجمالي: {len(all_ids)}
-• من broadcast_history: {len(broadcast_ids)}
-• من activity_log: {len(activity_ids)}
-• من contact_messages: {len(contact_ids)}
-
-✨ <b>التسجيلات الجديدة:</b>
-• مستخدمين جدد: {new_users}
-• قنوات/مجموعات جديدة: {new_chats}
-• أخطاء: {errors}
-
-📈 <b>الإحصائيات المحدثة:</b>
-• المستخدمين: {stats['users']['total']} ({stats['users']['active']} نشط)
-• القنوات: {stats['channels']['total']} ({stats['channels']['active']} نشطة)
-• المجموعات: {stats['groups']['total']} ({stats['groups']['active']} نشطة)
-
-💡 الآن يمكنك إرسال إذاعات لجميع المستخدمين المسجلين!
-
-📝 <b>لإضافة مستخدمين قدامى غير موجودين في السجلات:</b>
-• أرسل ملف نصي (.txt) يحتوي على IDs (كل ID في سطر منفصل)
-• مثال: 
-  123456789
-  -1001234567890
-  987654321"""
-        
-        # إضافة keyboard للاستيراد
-        keyboard = types.ReplyKeyboardMarkup(keyboard=[
-            [types.KeyboardButton(text="🌐 جلب من Telegram")],
-            [types.KeyboardButton(text="📄 استيراد من ملف"), types.KeyboardButton(text="💾 استيراد من قاعدة قديمة")],
-            [types.KeyboardButton(text="رجوع للوحة التحكم")]
-        ], resize_keyboard=True)
-        
-        await wait_msg.delete()
-        await message.answer(result_text, parse_mode="HTML", reply_markup=keyboard)
-        
-    except Exception as e:
-        logger.error(f"❌ Error in collect_ids: {e}")
-        await wait_msg.delete()
-        await message.answer(f"❌ حدث خطأ: {str(e)}")
-
-# تم حذف: ImportIDsStates FSM وكل دوال الاستيراد
-
-@router.message(F.text.in_(["جلب من Telegram", "🌐 جلب من Telegram", "🔄 جلب من Telegram API"]))
-async def btn_fetch_from_telegram(message: types.Message):
-    """جلب IDs من آخر تحديثات Telegram"""
-    if not get_db().is_admin(message.from_user.id):
-        await message.answer("⛔ هذا الأمر للمشرفين فقط")
-        return
-    
-    wait_msg = await message.answer("⏳ جاري جلب التحديثات من Telegram...\nقد يستغرق دقيقة...")
-    
-    try:
-        from aiogram.methods import GetUpdates
-        
-        collected_users = set()
-        collected_chats = set()
-        
-        # محاولة جلب آخر 100 تحديث
-        offset = -100  # آخر 100 update
-        
-        try:
-            # جلب التحديثات باستخدام getUpdates
-            updates = await bot.get_updates(offset=offset, limit=100, timeout=30)
-            
-            logger.info(f"📥 Received {len(updates)} updates from Telegram")
-            
-            for update in updates:
-                # استخراج IDs من أنواع مختلفة من التحديثات
-                
-                # من الرسائل العادية
-                if update.message:
-                    if update.message.from_user:
-                        collected_users.add(update.message.from_user.id)
-                    if update.message.chat:
-                        chat_id = update.message.chat.id
-                        if chat_id < 0:  # Group or Channel
-                            collected_chats.add(chat_id)
-                        else:
-                            collected_users.add(chat_id)
-                
-                # من الرسائل المحررة
-                if update.edited_message:
-                    if update.edited_message.from_user:
-                        collected_users.add(update.edited_message.from_user.id)
-                    if update.edited_message.chat:
-                        chat_id = update.edited_message.chat.id
-                        if chat_id < 0:
-                            collected_chats.add(chat_id)
-                
-                # من callback queries
-                if update.callback_query:
-                    if update.callback_query.from_user:
-                        collected_users.add(update.callback_query.from_user.id)
-                    if update.callback_query.message and update.callback_query.message.chat:
-                        chat_id = update.callback_query.message.chat.id
-                        if chat_id < 0:
-                            collected_chats.add(chat_id)
-                
-                # من my_chat_member (عند إضافة البوت)
-                if update.my_chat_member:
-                    if update.my_chat_member.from_user:
-                        collected_users.add(update.my_chat_member.from_user.id)
-                    if update.my_chat_member.chat:
-                        chat_id = update.my_chat_member.chat.id
-                        if chat_id < 0:
-                            collected_chats.add(chat_id)
-                
-                # من chat_member
-                if update.chat_member:
-                    if update.chat_member.from_user:
-                        collected_users.add(update.chat_member.from_user.id)
-                    if update.chat_member.chat:
-                        chat_id = update.chat_member.chat.id
-                        if chat_id < 0:
-                            collected_chats.add(chat_id)
-            
-            logger.info(f"✅ Collected {len(collected_users)} users, {len(collected_chats)} chats")
-            
-        except Exception as e:
-            logger.error(f"❌ Error fetching updates: {e}")
-            # المحاولة الثانية: استخدام getMe لجلب معلومات أساسية
-            await wait_msg.edit_text("⏳ جاري البحث بطريقة بديلة...")
-        
-        # تسجيل IDs
-        conn = get_db().get_connection()
-        new_users = 0
-        new_chats = 0
-        already_exists = 0
-        errors = 0
-        
-        # تسجيل المستخدمين
-        for uid in collected_users:
-            try:
-                existing = conn.execute("SELECT user_id FROM users WHERE user_id=?", (uid,)).fetchone()
-                if not existing:
-                    # محاولة جلب معلومات المستخدم
-                    try:
-                        user_info = await bot.get_chat(uid)
-                        username = user_info.username or f"user_{uid}"
-                        first_name = user_info.first_name or ""
-                        
-                        conn.execute("""
-                            INSERT INTO users (user_id, username, first_name, join_date, last_activity, status)
-                            VALUES (?, ?, ?, datetime('now'), datetime('now'), 'active')
-                        """, (uid, username, first_name))
-                        new_users += 1
-                        logger.info(f"✨ Fetched user: {uid} (@{username})")
-                    except:
-                        # تسجيل بمعلومات أساسية
-                        conn.execute("""
-                            INSERT INTO users (user_id, username, join_date, last_activity, status)
-                            VALUES (?, ?, datetime('now'), datetime('now'), 'active')
-                        """, (uid, f"user_{uid}"))
-                        new_users += 1
-                else:
-                    already_exists += 1
-                    # تحديث last_activity
-                    conn.execute("UPDATE users SET last_activity=datetime('now') WHERE user_id=?", (uid,))
-            except Exception as e:
-                errors += 1
-                logger.error(f"❌ Error processing user {uid}: {e}")
-        
-        # تسجيل القنوات/المجموعات
-        for uid in collected_chats:
-            try:
-                existing = conn.execute("SELECT chat_id FROM chats WHERE chat_id=?", (uid,)).fetchone()
-                if not existing:
-                    try:
-                        chat_info = await bot.get_chat(uid)
-                        chat_type = chat_info.type
-                        chat_title = chat_info.title or "Unknown"
-                        
-                        conn.execute("""
-                            INSERT INTO chats (chat_id, type, title, join_date, last_activity, status)
-                            VALUES (?, ?, ?, datetime('now'), datetime('now'), 'active')
-                        """, (uid, chat_type, chat_title))
-                        new_chats += 1
-                        logger.info(f"✨ Fetched chat: {uid} ({chat_type}: {chat_title})")
-                    except Exception as e:
-                        # تسجيل بمعلومات أساسية
-                        conn.execute("""
-                            INSERT INTO chats (chat_id, type, title, join_date, last_activity, status)
-                            VALUES (?, 'unknown', 'Fetched Chat', datetime('now'), datetime('now'), 'active')
-                        """, (uid,))
-                        new_chats += 1
-                        logger.warning(f"⚠️ Fetched chat with basic info: {uid}")
-                else:
-                    already_exists += 1
-                    # تحديث last_activity
-                    conn.execute("UPDATE chats SET last_activity=datetime('now') WHERE chat_id=?", (uid,))
-            except Exception as e:
-                errors += 1
-                logger.error(f"❌ Error processing chat {uid}: {e}")
-        
-        conn.commit()
-        
-        # إحصائيات محدثة
-        stats = get_db().get_live_stats()
-        
-        total_collected = len(collected_users) + len(collected_chats)
-        
-        if total_collected == 0:
-            result_text = """⚠️ <b>لم يتم العثور على تحديثات جديدة</b>
-
-💡 <b>السبب المحتمل:</b>
-لم يتفاعل أحد مع البوت مؤخراً أو تم مسح تاريخ التحديثات.
-
-🎯 <b>الحلول البديلة:</b>
-
-<b>1. جلب من قاعدة بيانات قديمة:</b>
-   • اضغط "💾 استيراد من قاعدة قديمة"
-   • سيبحث في المجلدات وسلة المهملات
-
-<b>2. استخدام ملف IDs:</b>
-   • اضغط "📄 استيراد من ملف"
-   • أرسل ملف txt به IDs
-
-<b>3. البث المباشر:</b>
-   • ارسل إذاعة لأي ID تعرفه
-   • سيتم تسجيله تلقائياً عند النجاح"""
-        else:
-            result_text = f"""✅ <b>تم جلب IDs من Telegram!</b>
-
-📊 <b>IDs المكتشفة:</b>
-• مستخدمين: {len(collected_users)}
-• قنوات/مجموعات: {len(collected_chats)}
-• إجمالي: {total_collected}
-
-✨ <b>التسجيلات:</b>
-• جديد: {new_users + new_chats}
-• موجود مسبقاً: {already_exists}
-• أخطاء: {errors}
-
-📈 <b>الإحصائيات المحدثة:</b>
-• المستخدمين: {stats['users']['total']} ({stats['users']['active']} نشط)
-• القنوات: {stats['channels']['total']} ({stats['channels']['active']} نشطة)
-• المجموعات: {stats['groups']['total']} ({stats['groups']['active']} نشطة)
-• <b>إجمالي أهداف الإذاعة: {stats['broadcast']['all_targets']}</b>
-
-🎯 الآن يمكنك إرسال إذاعات لهم!"""
-        
-        await wait_msg.delete()
-        await message.answer(result_text, parse_mode="HTML")
-        
-        # العودة للوحة التحكم
-        await btn_admin_panel(message)
-        
-    except Exception as e:
-        logger.error(f"❌ Error in fetch_from_telegram: {e}")
-        await wait_msg.delete()
-        
-        error_text = f"""❌ <b>حدث خطأ في الجلب</b>
-
-الخطأ: {str(e)}
-
-💡 <b>جرب الحلول البديلة:</b>
-
-<b>1. استيراد من قاعدة قديمة:</b>
-اضغط "💾 استيراد من قاعدة قديمة"
-
-<b>2. استخدام ملف IDs:</b>
-اضغط "📄 استيراد من ملف"""
-        
-        await message.answer(error_text, parse_mode="HTML")
 
 # === تم حذف جميع handlers: btn_fix_chat_types, btn_check_bot_admin, btn_check_registered_chats, btn_discover_new_chats, btn_import_from_old_db, import_all_old_dbs ===
 
@@ -8672,141 +8357,170 @@ async def btn_inbox(message: types.Message):
     await wait_msg.delete()
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
+# ==========================================
+# إدارة القرآن الصوتي - نظام متكامل (مُصلح)
+# ==========================================
+
 @router.message(F.text.in_(["إدارة القرآن الصوتي", "🎙️ إدارة القرآن الصوتي"]))
 async def btn_audio_admin(message: types.Message):
-    """لوحة تحكم القرآن الصوتي المتقدمة"""
+    """لوحة تحكم القرآن الصوتي"""
     if not get_db().is_admin(message.from_user.id):
         await message.answer("⛔ هذا الأمر للمشرفين فقط")
         return
-    
-    wait_msg = await message.answer("⏳ جاري تحميل البيانات...")
     
     db = get_db()
     conn = db.get_connection()
     
     total_reciters = conn.execute("SELECT COUNT(*) FROM reciters").fetchone()[0] or 0
     total_audio = conn.execute("SELECT COUNT(*) FROM quran_audio").fetchone()[0] or 0
-    total_surahs = 114
-    coverage = (total_audio / (total_reciters * total_surahs) * 100) if total_reciters > 0 else 0
     
+    # آخر 3 قراء مضافين
     recent_reciters = conn.execute("""
-        SELECT name FROM reciters 
-        ORDER BY id DESC 
+        SELECT name FROM reciters
+        ORDER BY id DESC
         LIMIT 3
     """).fetchall()
     
     conn.close()
     
-    recent_list = "\n".join([f"  • {r[0]}" for r in recent_reciters]) if recent_reciters else "  لا يوجد"
+    recent_list = "\n".join([f"• {r[0]}" for r in recent_reciters]) if recent_reciters else "لا يوجد"
     
     text = f"""
-╔═══════════════════════════╗
-║ 🎙️ <b>إدارة القرآن الصوتي</b> ║
-╚═══════════════════════════╝
+🎙️ <b>إدارة القرآن الصوتي</b>
 
-📊 <b>الإحصائيات:</b>
-━━━━━━━━━━━━━━━━━━━━━━━━
+📊 الإحصائيات:
 • القراء: <code>{total_reciters}</code>
-• الملفات الصوتية: <code>{total_audio}</code>
-• نسبة التغطية: <code>{coverage:.1f}%</code>
+• التلاوات: <code>{total_audio}</code>
 
-📌 <b>أحدث القراء:</b>
+📌 آخر القراء المضافين:
 {recent_list}
 
-━━━━━━━━━━━━━━━━━━━━━━━━
-
-💡 <b>اختر العملية المطلوبة:</b>
+اختر العملية:
 """
     
     keyboard = types.ReplyKeyboardMarkup(keyboard=[
-        [types.KeyboardButton(text="➕ إضافة قارئ"), types.KeyboardButton(text="📋 قائمة القراء")],
-        [types.KeyboardButton(text="📤 رفع تلاوة"), types.KeyboardButton(text="🔍 بحث عن قارئ")],
-        [types.KeyboardButton(text="📊 إحصائيات مفصلة"), types.KeyboardButton(text="🗑️ إدارة الحذف")],
-        [types.KeyboardButton(text="⚙️ إعدادات متقدمة"), types.KeyboardButton(text="🌐 استيراد من API")],
-        [types.KeyboardButton(text="رجوع"), types.KeyboardButton(text="القائمة الرئيسية")]
+        [types.KeyboardButton(text="➕ إضافة قارئ جديد"), types.KeyboardButton(text="📋 عرض القراء")],
+        [types.KeyboardButton(text="📤 رفع تلاوة جديدة"), types.KeyboardButton(text="🔍 بحث عن قارئ")],
+        [types.KeyboardButton(text="🗑️ حذف قارئ"), types.KeyboardButton(text="📊 إحصائيات")],
+        [types.KeyboardButton(text="رجوع للوحة التحكم")]
     ], resize_keyboard=True)
     
-    await wait_msg.delete()
     await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
 
-# ==========================================
-# إضافة قارئ جديد - يجب أن يكون قبل user_tracker
-# ==========================================
-
-@router.message(F.text == "➕ إضافة قارئ")
-async def btn_add_reciter(message: types.Message, state: FSMContext):
-    """إضافة قارئ جديد"""
-    if not get_db().is_admin(message.from_user.id): return
+@router.message(F.text == "➕ إضافة قارئ جديد")
+async def btn_add_reciter_start(message: types.Message, state: FSMContext):
+    if not get_db().is_admin(message.from_user.id): 
+        return
     
     await message.answer(
         "📝 <b>إضافة قارئ جديد</b>\n\n"
         "أرسل اسم القارئ بالعربية:",
         parse_mode="HTML",
-        reply_markup=get_cancel_kb()
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="❌ إلغاء")]], 
+            resize_keyboard=True
+        )
     )
     await state.set_state(Form.quran_add_reciter_name)
 
-@router.message(F.text == "📋 قائمة القراء")
-async def btn_list_reciters(message: types.Message):
-    """عرض قائمة جميع القراء"""
-    if not get_db().is_admin(message.from_user.id): return
+@router.message(Form.quran_add_reciter_name)
+async def process_add_reciter_name(message: types.Message, state: FSMContext):
+    if message.text == "❌ إلغاء":
+        await state.clear()
+        await btn_audio_admin(message)
+        return
     
-    wait_msg = await message.answer("⏳ جاري التحميل...")
+    if len(message.text.strip()) < 2:
+        await message.answer("⚠️ الاسم قصير جداً!")
+        return
+    
+    await state.update_data(reciter_name=message.text.strip())
+    
+    await message.answer(
+        "📝 أرسل معلومات إضافية عن القارئ (اختياري):\n"
+        "أو اكتب /skip للتخطي",
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="/skip")], [types.KeyboardButton(text="❌ إلغاء")]], 
+            resize_keyboard=True
+        )
+    )
+    await state.set_state(Form.quran_add_reciter_info)
+
+@router.message(Form.quran_add_reciter_info)
+async def process_add_reciter_info(message: types.Message, state: FSMContext):
+    if message.text == "❌ إلغاء":
+        await state.clear()
+        await btn_audio_admin(message)
+        return
+    
+    data = await state.get_data()
+    name = data['reciter_name']
+    info = None if message.text == "/skip" else message.text.strip()
+    
+    db = get_db()
+    conn = db.get_connection()
+    
+    try:
+        cursor = conn.execute(
+            "INSERT INTO reciters (name, description, added_at, added_by) VALUES (?, ?, ?, ?)",
+            (name, info, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message.from_user.id)
+        )
+        reciter_id = cursor.lastrowid
+        conn.commit()
+        
+        await message.answer(
+            f"✅ <b>تم إضافة القارئ بنجاح!</b>\n\n"
+            f"الاسم: {name}\n"
+            f"الرقم: <code>{reciter_id}</code>",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.answer(f"❌ خطأ: {e}")
+    finally:
+        conn.close()
+        await state.clear()
+        await btn_audio_admin(message)
+
+@router.message(F.text == "📋 عرض القراء")
+async def btn_list_reciters(message: types.Message):
+    if not get_db().is_admin(message.from_user.id): 
+        return
     
     db = get_db()
     conn = db.get_connection()
     
     reciters = conn.execute("""
-        SELECT id, name, description,
-               (SELECT COUNT(*) FROM quran_audio WHERE reciter_id = reciters.id) as audio_count
-        FROM reciters
-        ORDER BY name
+        SELECT r.id, r.name, r.description,
+               COUNT(qa.id) as audio_count
+        FROM reciters r
+        LEFT JOIN quran_audio qa ON r.id = qa.reciter_id
+        GROUP BY r.id
+        ORDER BY r.name
     """).fetchall()
     
     conn.close()
     
     if not reciters:
-        await wait_msg.delete()
-        await message.answer(
-            "📋 <b>قائمة القراء</b>\n\n"
-            "لا يوجد قراء مسجلون حالياً\n\n"
-            "💡 استخدم 'إضافة قارئ' لإضافة قارئ جديد",
-            parse_mode="HTML"
-        )
+        await message.answer("📭 لا يوجد قراء مسجلون")
         return
     
-    text = f"""📋 <b>قائمة القراء</b>
-
-📊 الإجمالي: <code>{len(reciters)}</code> قارئ
-
-━━━━━━━━━━━━━━━━━━━━━━
-
-"""
+    text = "📋 <b>قائمة القراء</b>\n\n"
     
-    for reciter in reciters:
-        rec_id, name, desc, audio_count = reciter
-        desc_text = f"\n  📝 {desc[:50]}..." if desc else ""
-        text += f"""<b>{name}</b>
-  🆔 ID: <code>{rec_id}</code>
-  🎵 التلاوات: {audio_count} سورة{desc_text}
+    for rec in reciters:
+        rec_id, name, desc, count = rec
+        text += f"🎙️ <b>{name}</b>\n"
+        text += f"   🆔 ID: <code>{rec_id}</code>\n"
+        text += f"   🎵 التلاوات: {count} سورة\n"
+        if desc:
+            text += f"   📝 {desc[:50]}...\n"
+        text += "\n"
+    
+    await message.answer(text, parse_mode="HTML")
 
-"""
-    
-    text += "\n💡 لإدارة قارئ، اضغط على 'إدارة الحذف'"
-    
-    keyboard = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ إضافة قارئ", callback_data="add_reciter")],
-        [InlineKeyboardButton(text="✏️ تعديل قارئ", callback_data="edit_reciter")],
-        [InlineKeyboardButton(text="🗑️ حذف قارئ", callback_data="delete_reciter")]
-    ])
-    
-    await wait_msg.delete()
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-
-@router.message(F.text == "📤 رفع تلاوة")
-async def btn_upload_audio(message: types.Message, state: FSMContext):
-    """رفع ملف صوتي جديد"""
-    if not get_db().is_admin(message.from_user.id): return
+@router.message(F.text == "📤 رفع تلاوة جديدة")
+async def btn_upload_audio_start(message: types.Message, state: FSMContext):
+    if not get_db().is_admin(message.from_user.id): 
+        return
     
     db = get_db()
     conn = db.get_connection()
@@ -8814,59 +8528,259 @@ async def btn_upload_audio(message: types.Message, state: FSMContext):
     conn.close()
     
     if not reciters:
-        await message.answer(
-            "❌ لا يوجد قراء مسجلون\n\n"
-            "💡 يجب إضافة قارئ أولاً من 'إضافة قارئ'",
-            parse_mode="HTML"
-        )
+        await message.answer("❌ لا يوجد قراء! أضف قارئاً أولاً.")
         return
-    
-    text = "📤 <b>رفع تلاوة جديدة</b>\n\n" \
-           "اختر القارئ:\n\n"
     
     keyboard = []
     for rec_id, name in reciters:
         keyboard.append([InlineKeyboardButton(
             text=f"🎙️ {name}",
-            callback_data=f"upload_reciter_{rec_id}"
+            callback_data=f"select_reciter_{rec_id}"
         )])
     
-    keyboard.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
-    
     await message.answer(
-        text,
+        "📤 <b>اختر القارئ:</b>",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
         parse_mode="HTML"
     )
 
+@router.callback_query(F.data.startswith("select_reciter_"))
+async def cb_select_reciter_for_upload(callback: types.CallbackQuery, state: FSMContext):
+    reciter_id = int(callback.data.split("_")[2])
+    await state.update_data(upload_reciter_id=reciter_id)
+    
+    # قائمة السور
+    surah_names = ["الفاتحة", "البقرة", "آل عمران", "النساء", "المائدة", "الأنعام", "الأعراف", "الأنفال", "التوبة", "يونس",
+        "هود", "يوسف", "الرعد", "إبراهيم", "الحجر", "النحل", "الإسراء", "الكهف", "مريم", "طه",
+        "الأنبياء", "الحج", "المؤمنون", "النور", "الفرقان", "الشعراء", "النمل", "القصص", "العنكبوت", "الروم",
+        "لقمان", "السجدة", "الأحزاب", "سبأ", "فاطر", "يس", "الصافات", "ص", "الزمر", "غافر",
+        "فصلت", "الشورى", "الزخرف", "الدخان", "الجاثية", "الأحقاف", "محمد", "الفتح", "الحجرات", "ق",
+        "الذاريات", "الطور", "النجم", "القمر", "الرحمن", "الواقعة", "الحديد", "المجادلة", "الحشر", "الممتحنة",
+        "الصف", "الجمعة", "المنافقون", "التغابن", "الطلاق", "التحريم", "الملك", "القلم", "الحاقة", "المعارج",
+        "نوح", "الجن", "المزمل", "المدثر", "القيامة", "الإنسان", "المرسلات", "النبأ", "النازعات", "عبس",
+        "التكوير", "الانفطار", "المطففين", "الانشقاق", "البروج", "الطارق", "الأعلى", "الغاشية", "الفجر", "البلد",
+        "الشمس", "الليل", "الضحى", "الشرح", "التين", "العلق", "القدر", "البينة", "الزلزلة", "العاديات",
+        "القارعة", "التكاثر", "العصر", "الهمزة", "الفيل", "قريش", "الماعون", "الكوثر", "الكافرون", "النصر",
+        "المسد", "الإخلاص", "الفلق", "الناس"]
+    
+    keyboard = []
+    row = []
+    for i, name in enumerate(surah_names, 1):
+        row.append(InlineKeyboardButton(
+            text=f"{i}. {name}",
+            callback_data=f"select_surah_{i}"
+        ))
+        if len(row) == 3:
+            keyboard.append(row)
+            row = []
+    if row:
+        keyboard.append(row)
+    
+    await callback.message.edit_text(
+        "📖 <b>اختر السورة:</b>",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("select_surah_"))
+async def cb_select_surah_for_upload(callback: types.CallbackQuery, state: FSMContext):
+    surah_num = int(callback.data.split("_")[2])
+    await state.update_data(upload_surah_num=surah_num)
+    
+    await callback.message.edit_text(
+        "📤 <b>أرسل الملف الصوتي الآن</b>\n\n"
+        "يمكنك إرسال:\n"
+        "• ملف صوتي (Audio)\n"
+        "• رسالة صوتية (Voice)\n\n"
+        "⏱️ المدة الموصى بها: 5-15 دقيقة",
+        parse_mode="HTML"
+    )
+    await state.set_state(Form.quran_upload_audio)
+    await callback.answer()
+
+@router.message(Form.quran_upload_audio)
+async def process_upload_audio_file(message: types.Message, state: FSMContext):
+    if not message.audio and not message.voice:
+        await message.answer("⚠️ يرجى إرسال ملف صوتي فقط!")
+        return
+    
+    data = await state.get_data()
+    reciter_id = data['upload_reciter_id']
+    surah_num = data['upload_surah_num']
+    
+    file_id = message.audio.file_id if message.audio else message.voice.file_id
+    file_size = message.audio.file_size if message.audio else message.voice.file_size
+    duration = message.audio.duration if message.audio else message.voice.duration
+    
+    db = get_db()
+    conn = db.get_connection()
+    
+    try:
+        # حذف التلاوة القديمة إذا وجدت
+        conn.execute(
+            "DELETE FROM quran_audio WHERE reciter_id = ? AND surah_number = ?",
+            (reciter_id, surah_num)
+        )
+        
+        # إضافة الجديدة
+        conn.execute("""
+            INSERT INTO quran_audio (reciter_id, surah_number, file_id, file_size, duration, uploaded_at, uploaded_by)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, (reciter_id, surah_num, file_id, file_size, duration, 
+              datetime.now().strftime("%Y-%m-%d %H:%M:%S"), message.from_user.id))
+        
+        conn.commit()
+        
+        # الحصول على اسم القارئ والسورة
+        reciter = conn.execute("SELECT name FROM reciters WHERE id = ?", (reciter_id,)).fetchone()
+        surah_names = ["الفاتحة", "البقرة", "آل عمران", "النساء", "المائدة", "الأنعام", "الأعراف", "الأنفال", "التوبة", "يونس",
+            "هود", "يوسف", "الرعد", "إبراهيم", "الحجر", "النحل", "الإسراء", "الكهف", "مريم", "طه",
+            "الأنبياء", "الحج", "المؤمنون", "النور", "الفرقان", "الشعراء", "النمل", "القصص", "العنكبوت", "الروم",
+            "لقمان", "السجدة", "الأحزاب", "سبأ", "فاطر", "يس", "الصافات", "ص", "الزمر", "غافر",
+            "فصلت", "الشورى", "الزخرف", "الدخان", "الجاثية", "الأحقاف", "محمد", "الفتح", "الحجرات", "ق",
+            "الذاريات", "الطور", "النجم", "القمر", "الرحمن", "الواقعة", "الحديد", "المجادلة", "الحشر", "الممتحنة",
+            "الصف", "الجمعة", "المنافقون", "التغابن", "الطلاق", "التحريم", "الملك", "القلم", "الحاقة", "المعارج",
+            "نوح", "الجن", "المزمل", "المدثر", "القيامة", "الإنسان", "المرسلات", "النبأ", "النازعات", "عبس",
+            "التكوير", "الانفطار", "المطففين", "الانشقاق", "البروج", "الطارق", "الأعلى", "الغاشية", "الفجر", "البلد",
+            "الشمس", "الليل", "الضحى", "الشرح", "التين", "العلق", "القدر", "البينة", "الزلزلة", "العاديات",
+            "القارعة", "التكاثر", "العصر", "الهمزة", "الفيل", "قريش", "الماعون", "الكوثر", "الكافرون", "النصر",
+            "المسد", "الإخلاص", "الفلق", "الناس"]
+        surah_name = surah_names[surah_num - 1] if surah_num <= 114 else f"سورة {surah_num}"
+        
+        await message.answer(
+            f"✅ <b>تم رفع التلاوة بنجاح!</b>\n\n"
+            f"🎙️ القارئ: {reciter[0] if reciter else 'غير معروف'}\n"
+            f"📖 السورة: {surah_name}\n"
+            f"⏱️ المدة: {duration // 60}:{duration % 60:02d}\n"
+            f"💾 الحجم: {file_size / 1024 / 1024:.2f} MB",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        await message.answer(f"❌ خطأ في الحفظ: {e}")
+    finally:
+        conn.close()
+        await state.clear()
+        await btn_audio_admin(message)
+
 @router.message(F.text == "🔍 بحث عن قارئ")
 async def btn_search_reciter(message: types.Message, state: FSMContext):
-    """البحث عن قارئ"""
-    if not get_db().is_admin(message.from_user.id): return
+    if not get_db().is_admin(message.from_user.id): 
+        return
     
     await message.answer(
         "🔍 <b>البحث عن قارئ</b>\n\n"
         "أرسل اسم القارئ أو جزء منه:",
         parse_mode="HTML",
-        reply_markup=get_cancel_kb()
+        reply_markup=types.ReplyKeyboardMarkup(
+            keyboard=[[types.KeyboardButton(text="❌ إلغاء")]], 
+            resize_keyboard=True
+        )
     )
     await state.set_state(Form.quran_select_reciter)
 
-@router.message(F.text == "📊 إحصائيات مفصلة")
-async def btn_audio_stats(message: types.Message):
-    """إحصائيات تفصيلية للقرآن الصوتي"""
-    if not get_db().is_admin(message.from_user.id): return
+@router.message(Form.quran_select_reciter)
+async def process_search_reciter(message: types.Message, state: FSMContext):
+    if message.text == "❌ إلغاء":
+        await state.clear()
+        await btn_audio_admin(message)
+        return
     
-    wait_msg = await message.answer("⏳ جاري التحليل...")
+    search_term = message.text.strip()
     
     db = get_db()
     conn = db.get_connection()
     
-    # إحصائيات عامة
+    reciters = conn.execute("""
+        SELECT r.id, r.name, r.description,
+               COUNT(qa.id) as audio_count
+        FROM reciters r
+        LEFT JOIN quran_audio qa ON r.id = qa.reciter_id
+        WHERE r.name LIKE ?
+        GROUP BY r.id
+        ORDER BY r.name
+    """, (f"%{search_term}%",)).fetchall()
+    
+    conn.close()
+    
+    if not reciters:
+        await message.answer(
+            f"❌ لم يتم العثور على قراء باسم: <b>{search_term}</b>",
+            parse_mode="HTML"
+        )
+        await state.clear()
+        return
+    
+    text = f"🔍 <b>نتائج البحث:</b> {search_term}\n\n"
+    for rec in reciters:
+        rec_id, name, desc, count = rec
+        text += f"🎙️ <b>{name}</b> (ID: {rec_id})\n"
+        text += f"   🎵 {count} سورة\n\n"
+    
+    await message.answer(text, parse_mode="HTML")
+    await state.clear()
+
+@router.message(F.text == "🗑️ حذف قارئ")
+async def btn_delete_reciter_start(message: types.Message):
+    if not get_db().is_admin(message.from_user.id): 
+        return
+    
+    db = get_db()
+    conn = db.get_connection()
+    reciters = conn.execute("SELECT id, name FROM reciters ORDER BY name").fetchall()
+    conn.close()
+    
+    if not reciters:
+        await message.answer("❌ لا يوجد قراء لحذفهم")
+        return
+    
+    keyboard = []
+    for rec_id, name in reciters:
+        keyboard.append([InlineKeyboardButton(
+            text=f"🗑️ {name}",
+            callback_data=f"confirm_delete_reciter_{rec_id}"
+        )])
+    keyboard.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel_delete_reciter")])
+    
+    await message.answer(
+        "⚠️ <b>اختر القارئ المراد حذفه:</b>\n\n"
+        "سيتم حذف القارئ وجميع تلاواته!",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data.startswith("confirm_delete_reciter_"))
+async def cb_confirm_delete_reciter(callback: types.CallbackQuery):
+    reciter_id = int(callback.data.split("_")[3])
+    
+    db = get_db()
+    conn = db.get_connection()
+    
+    # حذف التلاوات أولاً
+    conn.execute("DELETE FROM quran_audio WHERE reciter_id = ?", (reciter_id,))
+    # حذف القارئ
+    conn.execute("DELETE FROM reciters WHERE id = ?", (reciter_id,))
+    conn.commit()
+    conn.close()
+    
+    await callback.answer("✅ تم حذف القارئ بنجاح", show_alert=True)
+    await callback.message.edit_text("🗑️ تم حذف القارئ وجميع تلاواته")
+
+@router.callback_query(F.data == "cancel_delete_reciter")
+async def cb_cancel_delete_reciter(callback: types.CallbackQuery):
+    await callback.message.edit_text("❌ تم إلغاء الحذف")
+    await callback.answer()
+
+@router.message(F.text == "📊 إحصائيات")
+async def btn_audio_stats(message: types.Message):
+    if not get_db().is_admin(message.from_user.id): 
+        return
+    
+    db = get_db()
+    conn = db.get_connection()
+    
     total_reciters = conn.execute("SELECT COUNT(*) FROM reciters").fetchone()[0] or 0
     total_audio = conn.execute("SELECT COUNT(*) FROM quran_audio").fetchone()[0] or 0
-    total_size = conn.execute("SELECT SUM(file_size) FROM quran_audio").fetchone()[0] or 0
-    total_duration = conn.execute("SELECT SUM(duration) FROM quran_audio").fetchone()[0] or 0
     
     # أكثر القراء تلاوات
     top_reciters = conn.execute("""
@@ -8878,476 +8792,235 @@ async def btn_audio_stats(message: types.Message):
         LIMIT 5
     """).fetchall()
     
-    # إحصائيات حسب الشهر
-    monthly = conn.execute("""
-        SELECT strftime('%Y-%m', uploaded_at) as month, COUNT(*) as count
-        FROM quran_audio
-        GROUP BY month
-        ORDER BY month DESC
-        LIMIT 6
-    """).fetchall()
-    
     conn.close()
     
-    text = f"""📊 <b>إحصائيات القرآن الصوتي</b>
-
-━━━━━━━━━━━━━━━━━━━━━━
-
-📌 <b>الإحصائيات العامة:</b>
-• إجمالي القراء: <code>{total_reciters}</code>
-• إجمالي التلاوات: <code>{total_audio}</code>
-• مساحة التخزين: <code>{total_size / (1024*1024):.2f} MB</code>
-• المدة الكلية: <code>{total_duration // 3600}h {(total_duration % 3600) // 60}m</code>
-
-━━━━━━━━━━━━━━━━━━━━━━
-
-🏆 <b>أكثر 5 قراء تلاوات:</b>
-"""
+    text = f"📊 <b>إحصائيات القرآن الصوتي</b>\n\n"
+    text += f"• القراء: <code>{total_reciters}</code>\n"
+    text += f"• التلاوات: <code>{total_audio}</code>\n\n"
+    text += "<b>🏆 أكثر القراء تلاوات:</b>\n"
     
     for i, (name, count) in enumerate(top_reciters, 1):
-        text += f"{i}. {name}: <code>{count}</code> سورة\n"
-    
-    text += "\n━━━━━━━━━━━━━━━━━━━━━━\n\n📈 <b>الإضافات الشهرية:</b>\n"
-    
-    for month, count in monthly:
-        text += f"• {month}: <code>{count}</code> تلاوة\n"
-    
-    await wait_msg.delete()
-    await message.answer(text, parse_mode="HTML")
-
-@router.message(F.text == "🗑️ إدارة الحذف")
-async def btn_delete_management(message: types.Message):
-    """إدارة حذف القراء والتلاوات"""
-    if not get_db().is_admin(message.from_user.id): return
-    
-    text = """🗑️ <b>إدارة الحذف</b>
-
-⚠️ <b>تحذير:</b> الحذف نهائي ولا يمكن التراجع عنه!
-
-اختر نوع الحذف:"""
-    
-    keyboard = types.ReplyKeyboardMarkup(keyboard=[
-        [types.KeyboardButton(text="🗑️ حذف قارئ"), types.KeyboardButton(text="🗑️ حذف تلاوة")],
-        [types.KeyboardButton(text="🗑️ حذف جميع تلاوات قارئ")],
-        [types.KeyboardButton(text="رجوع")]
-    ], resize_keyboard=True)
-    
-    await message.answer(text, reply_markup=keyboard, parse_mode="HTML")
-
-@router.message(F.text == "🗑️ حذف قارئ")
-async def btn_delete_reciter(message: types.Message, state: FSMContext):
-    """حذف قارئ"""
-    if not get_db().is_admin(message.from_user.id): return
-    
-    db = get_db()
-    conn = db.get_connection()
-    reciters = conn.execute("""
-        SELECT id, name, 
-               (SELECT COUNT(*) FROM quran_audio WHERE reciter_id = reciters.id) as count
-        FROM reciters
-        ORDER BY name
-    """).fetchall()
-    conn.close()
-    
-    if not reciters:
-        await message.answer("❌ لا يوجد قراء لحذفهم")
-        return
-    
-    keyboard = []
-    for rec_id, name, count in reciters:
-        keyboard.append([InlineKeyboardButton(
-            text=f"🗑️ {name} ({count} تلاوة)",
-            callback_data=f"confirm_delete_rec_{rec_id}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
-    
-    await message.answer(
-        "🗑️ <b>حذف قارئ</b>\n\n"
-        "⚠️ سيتم حذف جميع تلاوات القارئ أيضاً!\n\n"
-        "اختر القارئ المراد حذفه:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
-        parse_mode="HTML"
-    )
-
-@router.message(F.text == "🗑️ حذف تلاوة")
-async def btn_delete_audio(message: types.Message):
-    """حذف تلاوة محددة"""
-    if not get_db().is_admin(message.from_user.id): return
-    
-    db = get_db()
-    conn = db.get_connection()
-    
-    # جلب جميع التلاوات مع أسماء القراء
-    audios = conn.execute("""
-        SELECT qa.id, r.name, qa.surah_number
-        FROM quran_audio qa
-        JOIN reciters r ON qa.reciter_id = r.id
-        ORDER BY r.name, qa.surah_number
-    """).fetchall()
-    
-    conn.close()
-    
-    if not audios:
-        await message.answer("❌ لا توجد تلاوات لحذفها")
-        return
-    
-    # إنشاء keyboard بحد أقصى 10 تلاوات (لمنع تجاوز حجم الرسالة)
-    keyboard = []
-    for audio_id, reciter_name, surah_num in audios[:10]:
-        keyboard.append([InlineKeyboardButton(
-            text=f"🗑️ {reciter_name} - سورة {surah_num}",
-            callback_data=f"confirm_del_audio_{audio_id}"
-        )])
-    
-    if len(audios) > 10:
-        keyboard.append([InlineKeyboardButton(
-            text=f"... و {len(audios)-10} تلاوة أخرى",
-            callback_data="show_more_audio"
-        )])
-    
-    keyboard.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
-    
-    await message.answer(
-        f"🗑️ <b>حذف تلاوة</b>\n\n"
-        f"📊 الإجمالي: {len(audios)} تلاوة\n\n"
-        f"اختر التلاوة المراد حذفها:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
-        parse_mode="HTML"
-    )
-
-@router.message(F.text == "🗑️ حذف جميع تلاوات قارئ")
-async def btn_delete_reciter_audios(message: types.Message):
-    """حذف جميع تلاوات قارئ معين"""
-    if not get_db().is_admin(message.from_user.id): return
-    
-    db = get_db()
-    conn = db.get_connection()
-    
-    reciters = conn.execute("""
-        SELECT r.id, r.name, COUNT(qa.id) as count
-        FROM reciters r
-        LEFT JOIN quran_audio qa ON r.id = qa.reciter_id
-        GROUP BY r.id
-        HAVING count > 0
-        ORDER BY r.name
-    """).fetchall()
-    
-    conn.close()
-    
-    if not reciters:
-        await message.answer("❌ لا توجد تلاوات لحذفها")
-        return
-    
-    keyboard = []
-    for rec_id, name, count in reciters:
-        keyboard.append([InlineKeyboardButton(
-            text=f"🗑️ {name} ({count} تلاوة)",
-            callback_data=f"confirm_del_rec_audios_{rec_id}"
-        )])
-    
-    keyboard.append([InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel")])
-    
-    await message.answer(
-        "🗑️ <b>حذف جميع تلاوات قارئ</b>\n\n"
-        "⚠️ سيتم حذف جميع التلاوات فقط (القارئ سيبقى)\n\n"
-        "اختر القارئ:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=keyboard),
-        parse_mode="HTML"
-    )
-
-@router.message(F.text == "🌐 استيراد من API")
-async def btn_import_api(message: types.Message):
-    """استيراد قراء من quran.com API"""
-    if not get_db().is_admin(message.from_user.id): return
-    
-    text = """🌐 <b>استيراد من API</b>
-
-📡 يمكنك استيراد قراء وتلاوات من:
-• quran.com
-• alquran.cloud
-• mp3quran.net
-
-⚙️ <b>هذه الميزة قيد التطوير</b>
-
-💡 حالياً يمكنك رفع الملفات يدوياً من 'رفع تلاوة'"""
+        text += f"{i}. {name}: {count} سورة\n"
     
     await message.answer(text, parse_mode="HTML")
 
-@router.message(F.text == "⚙️ إعدادات متقدمة")
-async def btn_advanced_settings(message: types.Message):
-    """إعدادات متقدمة للقرآن الصوتي"""
-    if not get_db().is_admin(message.from_user.id): return
-    
-    text = """⚙️ <b>الإعدادات المتقدمة</b>
 
-🔧 <b>الإعدادات المتاحة:</b>
-• جودة التشغيل
-• التخزين المؤقت
-• حد الحجم الأقصى
-• تنظيف الملفات القديمة
-
-💡 <b>قريباً...</b>"""
+@router.message(F.text.in_(["إلغاء", "❌ إلغاء", "الغاء"]), StateFilter("*"))
+async def universal_cancel_handler(message: types.Message, state: FSMContext):
+    """إلغاء عام يعمل في أي state ويعود للقائمة المناسبة"""
+    current_state = await state.get_state()
     
-    await message.answer(text, parse_mode="HTML")
-
-# ==========================================
-# Handlers للـ States الخاصة بالقرآن الصوتي
-# ==========================================
-
-@router.message(Form.quran_add_reciter_name)
-async def process_add_reciter_name(message: types.Message, state: FSMContext):
-    if message.text == "رجوع":
-        await state.clear()
-        await cmd_start(message)
-        return
-    """معالجة اسم القارئ الجديد"""
-    if message.text == "إلغاء":
-        await state.clear()
-        keyboard = get_admin_kb() if get_db().is_admin(message.from_user.id) else get_main_kb(message.from_user.id, False)
-        await message.answer("❌ تم الإلغاء.", reply_markup=keyboard)
-        return
+    # مسح الحالة
+    await state.clear()
     
-    reciter_name = message.text.strip()
-    
-    if not reciter_name or len(reciter_name) < 2:
-        await message.answer("⚠️ الاسم قصير جداً! أدخل اسماً صحيحاً.")
-        return
-    
-    await state.update_data(reciter_name=reciter_name)
-    
-    await message.answer(
-        f"✅ الاسم: <b>{reciter_name}</b>\n\n"
-        "📝 أرسل معلومات إضافية عن القارئ (اختياري):\n"
-        "أو اضغط /skip للتخطي",
-        parse_mode="HTML",
-        reply_markup=get_cancel_kb()
-    )
-    await state.set_state(Form.quran_add_reciter_info)
-
-@router.message(Form.quran_add_reciter_info)
-async def process_add_reciter_info(message: types.Message, state: FSMContext):
-    if message.text == "رجوع":
-        await state.clear()
-        await cmd_start(message)
-        return
-    """معالجة معلومات القارئ"""
-    if message.text == "إلغاء":
-        await state.clear()
-        keyboard = get_admin_kb() if get_db().is_admin(message.from_user.id) else get_main_kb(message.from_user.id, False)
-        await message.answer("❌ تم الإلغاء.", reply_markup=keyboard)
-        return
-    
-    data = await state.get_data()
-    reciter_name = data.get('reciter_name')
-    
-    description = None if message.text == "/skip" else message.text.strip()
-    
-    # حفظ القارئ في قاعدة البيانات
     db = get_db()
-    conn = db.get_connection()
+    is_admin = db.is_admin(message.from_user.id)
     
-    try:
-        cursor = conn.execute(
-            "INSERT INTO reciters (name, description, created_at) VALUES (?, ?, datetime('now'))",
-            (reciter_name, description)
-        )
-        reciter_id = cursor.lastrowid
-        conn.commit()
+    # تحديد الوجهة بناءً على نوع المستخدم
+    if is_admin:
+        # للمشرفين: العودة للوحة التحكم
+        keyboard = types.ReplyKeyboardMarkup(keyboard=[
+            [types.KeyboardButton(text="📢 إذاعة"), types.KeyboardButton(text="📊 الإحصائيات")],
+            [types.KeyboardButton(text="📅 جدولة رسالة"), types.KeyboardButton(text="📬 رسائل واردة")],
+            [types.KeyboardButton(text="👥 إدارة المشرفين"), types.KeyboardButton(text="📣 القنوات والمجموعات")],
+            [types.KeyboardButton(text="🎙️ إدارة القرآن الصوتي"), types.KeyboardButton(text="🛡️ حماية البيانات")],
+            [types.KeyboardButton(text="🎯 التحكم بالأزرار"), types.KeyboardButton(text="🧹 صيانة البوت")],
+            [types.KeyboardButton(text="رجوع للقائمة الرئيسية")]
+        ], resize_keyboard=True)
         
         await message.answer(
-            f"✅ <b>تم إضافة القارئ بنجاح!</b>\n\n"
-            f"🎙️ الاسم: {reciter_name}\n"
-            f"🆔 الرقم: <code>{reciter_id}</code>\n\n"
-            f"💡 يمكنك الآن رفع التلاوات من 'رفع تلاوة'",
+            "❌ تم الإلغاء.\n\n🔧 <b>لوحة التحكم:</b>",
+            reply_markup=keyboard,
             parse_mode="HTML"
         )
-    except Exception as e:
-        await message.answer(f"❌ خطأ في الحفظ: {e}")
-        logger.error(f"Error adding reciter: {e}")
-    finally:
-        conn.close()
-    
-    await state.clear()
-    keyboard = get_admin_kb() if get_db().is_admin(message.from_user.id) else get_main_kb(message.from_user.id, False)
-    await message.answer("تم!", reply_markup=keyboard)
-
-@router.message(Form.quran_select_reciter)
-async def process_search_reciter(message: types.Message, state: FSMContext):
-    if message.text == "رجوع":
-        await state.clear()
-        await cmd_start(message)
-        return
-    """معالجة البحث عن قارئ"""
-    if message.text == "إلغاء":
-        await state.clear()
-        keyboard = get_admin_kb() if get_db().is_admin(message.from_user.id) else get_main_kb(message.from_user.id, False)
-        await message.answer("❌ تم الإلغاء.", reply_markup=keyboard)
-        return
-    
-    search_term = message.text.strip()
-    
-    db = get_db()
-    conn = db.get_connection()
-    
-    reciters = conn.execute("""
-        SELECT id, name, description,
-               (SELECT COUNT(*) FROM quran_audio WHERE reciter_id = reciters.id) as audio_count
-        FROM reciters
-        WHERE name LIKE ?
-        ORDER BY name
-    """, (f"%{search_term}%",)).fetchall()
-    
-    conn.close()
-    
-    if not reciters:
-        await message.answer(
-            f"❌ لم يتم العثور على قراء باسم: <b>{search_term}</b>\n\n"
-            "💡 جرب كلمات بحث أخرى",
-            parse_mode="HTML"
-        )
-        await state.clear()
-        return
-    
-    text = f"""🔍 <b>نتائج البحث عن:</b> {search_term}
-
-📊 النتائج: <code>{len(reciters)}</code> قارئ
-
-━━━━━━━━━━━━━━━━━━━━━━
-
-"""
-    
-    for reciter in reciters:
-        rec_id, name, desc, audio_count = reciter
-        desc_text = f"\n  📝 {desc[:50]}..." if desc else ""
-        text += f"""<b>{name}</b>
-  🆔 ID: <code>{rec_id}</code>
-  🎵 التلاوات: {audio_count} سورة{desc_text}
-
-"""
-    
-    await message.answer(text, parse_mode="HTML")
-    await state.clear()
-    
-    keyboard = get_admin_kb() if get_db().is_admin(message.from_user.id) else get_main_kb(message.from_user.id, False)
-    await message.answer("تم!", reply_markup=keyboard)
-
-@router.message(Form.quran_select_surah)
-async def process_select_surah(message: types.Message, state: FSMContext):
-    if message.text == "رجوع":
-        await state.clear()
-        await cmd_start(message)
-        return
-    """معالجة اختيار السورة"""
-    if message.text == "إلغاء":
-        await state.clear()
-        keyboard = get_admin_kb() if get_db().is_admin(message.from_user.id) else get_main_kb(message.from_user.id, False)
-        await message.answer("❌ تم الإلغاء.", reply_markup=keyboard)
-        return
-    
-    try:
-        surah_number = int(message.text)
-        if surah_number < 1 or surah_number > 114:
-            await message.answer("⚠️ رقم السورة يجب أن يكون بين 1 و 114")
-            return
-    except ValueError:
-        await message.answer("⚠️ أدخل رقم السورة (1-114)")
-        return
-    
-    await state.update_data(surah_number=surah_number)
-    
-    await message.answer(
-        f"✅ السورة رقم: <code>{surah_number}</code>\n\n"
-        "📤 الآن أرسل الملف الصوتي للتلاوة",
-        parse_mode="HTML",
-        reply_markup=get_cancel_kb()
-    )
-    await state.set_state(Form.quran_upload_audio)
-
-@router.message(Form.quran_upload_audio)
-async def process_upload_audio(message: types.Message, state: FSMContext):
-    if message.text == "رجوع":
-        await state.clear()
-        await cmd_start(message)
-        return
-    """معالجة رفع الملف الصوتي"""
-    if message.text == "إلغاء":
-        await state.clear()
-        keyboard = get_admin_kb() if get_db().is_admin(message.from_user.id) else get_main_kb(message.from_user.id, False)
-        await message.answer("❌ تم الإلغاء.", reply_markup=keyboard)
-        return
-    
-    if not message.audio and not message.voice:
-        await message.answer("⚠️ أرسل ملف صوتي (Audio أو Voice)")
-        return
-    
-    data = await state.get_data()
-    reciter_id = data.get('reciter_id')
-    surah_number = data.get('surah_number')
-    
-    # معلومات الملف
-    if message.audio:
-        file_id = message.audio.file_id
-        file_size = message.audio.file_size
-        duration = message.audio.duration
     else:
-        file_id = message.voice.file_id
-        file_size = message.voice.file_size
-        duration = message.voice.duration
-    
-    # حفظ في قاعدة البيانات
-    db = get_db()
-    conn = db.get_connection()
-    
-    try:
-        # التحقق من عدم وجود تلاوة مكررة
-        existing = conn.execute(
-            "SELECT id FROM quran_audio WHERE reciter_id=? AND surah_number=?",
-            (reciter_id, surah_number)
-        ).fetchone()
-        
-        if existing:
-            await message.answer(
-                "⚠️ <b>تحذير:</b> يوجد تلاوة مسجلة لهذه السورة مع هذا القارئ!\n\n"
-                "هل تريد استبدالها؟",
-                parse_mode="HTML"
-            )
-            # يمكن إضافة تأكيد هنا
-        
-        conn.execute("""
-            INSERT OR REPLACE INTO quran_audio 
-            (reciter_id, surah_number, file_id, file_size, duration, uploaded_at)
-            VALUES (?, ?, ?, ?, ?, datetime('now'))
-        """, (reciter_id, surah_number, file_id, file_size, duration))
-        
-        conn.commit()
-        
-        # الحصول على اسم القارئ
-        reciter_name = conn.execute(
-            "SELECT name_ar FROM reciters WHERE id=?", (reciter_id,)
-        ).fetchone()[0]
-        
-        await message.answer(
-            f"✅ <b>تم رفع التلاوة بنجاح!</b>\n\n"
-            f"🎙️ القارئ: {reciter_name}\n"
-            f"📖 السورة: {surah_number}\n"
-            f"⏱️ المدة: {duration}s\n"
-            f"💾 الحجم: {file_size / 1024:.1f} KB",
-            parse_mode="HTML"
-        )
-    except Exception as e:
-        await message.answer(f"❌ خطأ في الحفظ: {e}")
-        logger.error(f"Error uploading audio: {e}")
-    finally:
-        conn.close()
-    
-    await state.clear()
-    keyboard = get_admin_kb() if get_db().is_admin(message.from_user.id) else get_main_kb(message.from_user.id, False)
-    await message.answer("تم!", reply_markup=keyboard)
-
+        # للمستخدمين العاديين: العودة للقائمة الرئيسية
+        await cmd_start(message)
 # ==========================================
 # تتبع المستخدمين والقنوات - يأتي بعد أزرار الرجوع
 # ==========================================
+# ==========================================
+# نظام الصيانة الذكي
+# ==========================================
+
+@router.message(F.text == "🧹 صيانة البوت")
+async def btn_bot_maintenance(message: types.Message):
+    """تنظيف وصيانة البوت"""
+    if not get_db().is_admin(message.from_user.id):
+        await message.answer("⛔ هذا الأمر للمشرفين فقط")
+        return
+    
+    keyboard = types.ReplyKeyboardMarkup(keyboard=[
+        [types.KeyboardButton(text="🧹 تنظيف قاعدة البيانات")],
+        [types.KeyboardButton(text="🔄 تحديث الإحصائيات")],
+        [types.KeyboardButton(text="📊 فحص صحة البوت")],
+        [types.KeyboardButton(text="🗑️ حذف المستخدمين غير النشطين")],
+        [types.KeyboardButton(text="رجوع للوحة التحكم")]
+    ], resize_keyboard=True)
+    
+    await message.answer(
+        "🔧 <b>نظام الصيانة الذكي</b>\n\n"
+        "اختر العملية المطلوبة:\n\n"
+        "• <b>تنظيف قاعدة البيانات:</b> حذف السجلات القديمة لتحرير مساحة\n"
+        "• <b>تحديث الإحصائيات:</b> إعادة حساب الإحصائيات من الصفر\n"
+        "• <b>فحص صحة البوت:</b> التحقق من جميع الاتصالات والجداول\n"
+        "• <b>حذف غير النشطين:</b> حذف المستخدمين المتوقفين +30 يوم",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+@router.message(F.text == "🧹 تنظيف قاعدة البيانات")
+async def btn_clean_database(message: types.Message):
+    """تنظيف قاعدة البيانات من السجلات القديمة"""
+    if not get_db().is_admin(message.from_user.id):
+        return
+    
+    wait_msg = await message.answer("⏳ جاري التنظيف... قد يستغرق دقيقة")
+    
+    try:
+        db = get_db()
+        conn = db.get_connection()
+        
+        # حذف الإذاعات القديمة (أكثر من 60 يوم)
+        old_broadcasts = conn.execute(
+            "DELETE FROM broadcast_history WHERE sent_at < datetime('now', '-60 days')"
+        ).rowcount
+        
+        # حذف الأنشطة القديمة (أكثر من 30 يوم)
+        old_activities = conn.execute(
+            "DELETE FROM user_activity WHERE timestamp < datetime('now', '-30 days')"
+        ).rowcount
+        
+        # حذف رسائل التواصل القديمة (أكثر من 90 يوم)
+        old_contacts = conn.execute(
+            "DELETE FROM contact_messages WHERE sent_at < datetime('now', '-90 days')"
+        ).rowcount
+        
+        # تنظيف الجداول الملغاة/المنتهية
+        old_schedules = conn.execute(
+            "DELETE FROM scheduled_tasks WHERE validation_status = 'cancelled' OR (end_date < date('now') AND task_type = 'once')"
+        ).rowcount
+        
+        # تحسين قاعدة البيانات
+        conn.execute("VACUUM")
+        conn.commit()
+        
+        # حساب المساحة المحررة
+        db_size_after = os.path.getsize(DB_NAME) / (1024*1024)
+        
+        await wait_msg.edit_text(
+            f"✅ <b>تم التنظيف بنجاح!</b>\n\n"
+            f"🗑️ <b>العناصر المحذوفة:</b>\n"
+            f"• إذاعات قديمة: <code>{old_broadcasts}</code>\n"
+            f"• أنشطة قديمة: <code>{old_activities}</code>\n"
+            f"• رسائل تواصل: <code>{old_contacts}</code>\n"
+            f"• جداول منتهية: <code>{old_schedules}</code>\n\n"
+            f"💾 <b>حجم القاعدة الآن:</b> <code>{db_size_after:.2f}</code> ميجابايت\n"
+            f"⚡ <b>الأداء:</b> تم تحسين سرعة القاعدة",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ <b>خطأ في التنظيف:</b>\n<code>{e}</code>", parse_mode="HTML")
+
+@router.message(F.text == "🗑️ حذف المستخدمين غير النشطين")
+async def btn_clean_inactive_users(message: types.Message):
+    """حذف المستخدمين غير النشطين منذ 30 يوم"""
+    if not get_db().is_admin(message.from_user.id):
+        return
+    
+    keyboard = types.InlineKeyboardMarkup(inline_keyboard=[
+        [types.InlineKeyboardButton(text="✅ نعم، احذفهم", callback_data="confirm_clean_inactive")],
+        [types.InlineKeyboardButton(text="❌ إلغاء", callback_data="cancel_clean")]
+    ])
+    
+    db = get_db()
+    conn = db.get_connection()
+    count = conn.execute(
+        "SELECT COUNT(*) FROM users WHERE last_activity < datetime('now', '-30 days') AND status = 'active'"
+    ).fetchone()[0]
+    conn.close()
+    
+    await message.answer(
+        f"⚠️ <b>تنبيه!</b>\n\n"
+        f"سيتم حذف <code>{count}</code> مستخدم غير نشط منذ 30 يوماً.\n\n"
+        f"هل أنت متأكد؟",
+        reply_markup=keyboard,
+        parse_mode="HTML"
+    )
+
+@router.callback_query(F.data == "confirm_clean_inactive")
+async def cb_confirm_clean_inactive(callback: types.CallbackQuery):
+    """تأكيد حذف غير النشطين"""
+    db = get_db()
+    conn = db.get_connection()
+    deleted = conn.execute(
+        "DELETE FROM users WHERE last_activity < datetime('now', '-30 days') AND status = 'active'"
+    ).rowcount
+    conn.commit()
+    conn.close()
+    
+    await callback.message.edit_text(
+        f"✅ <b>تم الحذف!</b>\n\n"
+        f"🗑️ عدد المستخدمين المحذوفين: <code>{deleted}</code>",
+        parse_mode="HTML"
+    )
+    await callback.answer()
+
+@router.callback_query(F.data == "cancel_clean")
+async def cb_cancel_clean(callback: types.CallbackQuery):
+    await callback.message.edit_text("❌ تم إلغاء العملية")
+    await callback.answer()
+
+@router.message(F.text == "📊 فحص صحة البوت")
+async def btn_health_check(message: types.Message):
+    """فحص صحة البوت وقاعدة البيانات"""
+    if not get_db().is_admin(message.from_user.id):
+        return
+    
+    wait_msg = await message.answer("⏳ جاري الفحص...")
+    
+    try:
+        db = get_db()
+        conn = db.get_connection()
+        
+        # فحص الجداول
+        tables = conn.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        table_list = [t[0] for t in tables]
+        
+        # فحص السلامة
+        integrity = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        
+        # عدد السجلات في كل جدول
+        stats = {}
+        for table in ['users', 'chats', 'scheduled_tasks', 'broadcast_history', 'quran_audio', 'reciters']:
+            try:
+                count = conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0]
+                stats[table] = count
+            except:
+                stats[table] = "خطأ"
+        
+        conn.close()
+        
+        status = "✅ سليمة" if integrity == "ok" else "❌ تالفة"
+        
+        await wait_msg.edit_text(
+            f"📊 <b>فحص صحة البوت</b>\n\n"
+            f"🔍 <b>سلامة القاعدة:</b> {status}\n"
+            f"📁 <b>عدد الجداول:</b> <code>{len(table_list)}</code>\n\n"
+            f"📈 <b>إحصائيات الجداول:</b>\n"
+            f"• المستخدمين: <code>{stats.get('users', 'N/A')}</code>\n"
+            f"• المحادثات: <code>{stats.get('chats', 'N/A')}</code>\n"
+            f"• الجداول المجدولة: <code>{stats.get('scheduled_tasks', 'N/A')}</code>\n"
+            f"• سجل الإذاعات: <code>{stats.get('broadcast_history', 'N/A')}</code>\n"
+            f"• التلاوات: <code>{stats.get('quran_audio', 'N/A')}</code>\n"
+            f"• القراء: <code>{stats.get('reciters', 'N/A')}</code>\n\n"
+            f"✅ <b>الحالة العامة:</b> البوت يعمل بكفاءة",
+            parse_mode="HTML"
+        )
+        
+    except Exception as e:
+        await wait_msg.edit_text(f"❌ <b>خطأ في الفحص:</b>\n<code>{e}</code>", parse_mode="HTML")
 
 @router.message()
 async def user_tracker(message: types.Message, state: FSMContext):
@@ -9407,7 +9080,6 @@ async def on_bot_added_to_chat(event: ChatMemberUpdated):
         
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="إعداد بوت آفاق", callback_data=f"setup_afaq_{chat.id}")],
-        [InlineKeyboardButton(text="إعداد المنبهات", callback_data=f"setup_alarms_{chat.id}")],
         [InlineKeyboardButton(text="إغلاق", callback_data="close_msg")]
     ])
     
@@ -9496,7 +9168,7 @@ async def process_alarm_content_type_select(message: types.Message, state: FSMCo
 
 @router.message(Form.data_add_file, F.text == "➕ إضافة محتوى جديد")
 async def btn_alarm_add_new(message: types.Message, state: FSMContext):
-    await message.answer("📤 <b>أرسل المحتوى الآن:</b> (نص، صورة، صوت...)", reply_markup=get_back_kb())
+    await message.answer("📤 <b>أرسل المحتوى الآن:</b> (نص، صورة، صوت...)", reply_markup= get_cancel_kb())
     await state.set_state(Form.custom_btn_add_text)
 
 @router.message(Form.custom_btn_add_text)
